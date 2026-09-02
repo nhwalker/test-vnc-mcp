@@ -83,6 +83,7 @@ export class VncSession {
       width: this.client.width,
       height: this.client.height,
       pointer: this.client.pointer,
+      clipboard: this.client.clipboard,
     };
   }
 

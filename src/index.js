@@ -90,7 +90,9 @@ tool(
   'vnc_status',
   {
     title: 'VNC connection status',
-    description: 'Report whether a desktop is connected, its size, name, and the pointer position.',
+    description:
+      'Report whether a desktop is connected, its size, name, the pointer position, and ' +
+      'the last clipboard text the desktop pushed (useful after a copy).',
     inputSchema: {},
     annotations: { readOnlyHint: true },
   },

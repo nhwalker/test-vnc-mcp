@@ -146,6 +146,8 @@ export class RfbClient {
 
     /** Bumped once per completed FramebufferUpdate, so callers can wait for one. */
     this.updateCount = 0;
+    /** Whatever the server last pushed as its clipboard, if anything. @type {string|null} */
+    this.clipboard = null;
     this.closed = false;
     this.closeReason = null;
 
@@ -454,12 +456,12 @@ export class RfbClient {
     });
   }
 
-  _notifyUpdate() {
+  _notifyUpdate(updated = true) {
     const waiters = this._updateWaiters;
     this._updateWaiters = [];
     for (const waiter of waiters) {
       clearTimeout(waiter.timer);
-      waiter.resolve(true);
+      waiter.resolve(updated);
     }
   }
 
@@ -468,7 +470,9 @@ export class RfbClient {
     this.closed = true;
     this.closeReason = err?.message ?? 'closed';
     this._socket.destroy();
-    this._notifyUpdate();
+    // Release anyone waiting, but as "nothing arrived" — the screen did not
+    // update, the connection went away.
+    this._notifyUpdate(false);
   }
 
   close() {
