@@ -1,0 +1,21 @@
+{
+  "name": "vnc-mcp",
+  "version": "0.1.0",
+  "description": "A minimal MCP server that lets an agent see and control a VNC desktop (screenshots + input injection).",
+  "type": "module",
+  "bin": { "vnc-mcp": "src/index.js" },
+  "main": "src/index.js",
+  "files": ["src"],
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node test/smoke.mjs"
+  },
+  "license": "Unlicense",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "@novnc/novnc": "^1.7.0",
+    "pngjs": "^7.0.0",
+    "zod": "^3.25.0"
+  }
+}
