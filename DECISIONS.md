@@ -164,9 +164,12 @@ make the model track button state and press/release pairs across calls, which is
 a reliable source of stuck modifiers and dragged windows. The tools here are
 complete gestures that always leave the input state clean.
 
-**`vnc_type` sends a keysym per character** (with shift held for characters that
-need it) rather than trying to emulate a keyboard layout. This is what noVNC does
-for pasted text, and it is layout-independent on the server side.
+**`vnc_type` sends one keysym per character** and does *not* synthesise shift for
+capitals or symbols. RFB carries keysyms, not scancodes, so `XK_A` already means
+"A"; the server picks whatever key produces that character. This is what noVNC
+does for pasted text, and it is layout-independent at both ends. Verified against
+x11vnc: typing `The quick brown fox 0123456789` arrives with its capital T
+intact.
 
 ---
 
