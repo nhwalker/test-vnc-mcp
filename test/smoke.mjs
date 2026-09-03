@@ -122,6 +122,32 @@ async function waitForDesktop(id, timeoutMs = 30000) {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/**
+ * Only a connection-level failure is worth retrying. An auth failure (wrong or
+ * missing password) means the handshake got far enough to be answered, so it is
+ * a real result, not a race — those tests must see it, not a retry.
+ */
+const TRANSIENT = /closed by the server|ECONNRESET|ECONNREFUSED|EPIPE|timed out connecting|could not connect/i;
+
+/**
+ * Connect, retrying while a just-started server settles. x11vnc can drop or
+ * refuse the first RFB connection for a moment after its port is open and the
+ * desktop has mapped, which otherwise fails the whole suite on the first test.
+ */
+async function retryConnect(thunk, { attempts = 6, label = 'connect' } = {}) {
+  let lastError;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await thunk();
+    } catch (err) {
+      lastError = err;
+      if (!TRANSIENT.test(err.message)) throw err;
+      await sleep(250 * (i + 1));
+    }
+  }
+  throw new Error(`${label} failed after ${attempts} attempts: ${lastError.message}`, { cause: lastError });
+}
+
 /** How many pixels differ between two RGBA buffers. */
 function pixelsDiffering(a, b) {
   let differing = 0;
@@ -140,7 +166,7 @@ async function testOpenDesktop() {
 
   const session = new VncSession({});
   try {
-    const status = await session.connect({ host: '127.0.0.1', port });
+    const status = await retryConnect(() => session.connect({ host: '127.0.0.1', port }));
 
     await test('connects and reads the desktop geometry', () => {
       assertEqual(status.connected, true, 'should be connected');
@@ -283,7 +309,7 @@ async function testOpenDesktop() {
 
       // A fresh connection gets the true screen from scratch. Our scrolled
       // copy must agree with it.
-      const fresh = await RfbClient.connect({ host: '127.0.0.1', port });
+      const fresh = await retryConnect(() => RfbClient.connect({ host: '127.0.0.1', port }), { label: 'fresh capture' });
       try {
         await fresh.waitForUpdate(10000);
         await fresh.waitForUpdate(300);
@@ -352,7 +378,7 @@ async function testEncodings() {
   await sleep(1500); // let the desktop finish painting so every capture sees the same pixels
 
   async function capture(options) {
-    const client = await RfbClient.connect({ host: '127.0.0.1', port, timeoutMs: 15000, ...options });
+    const client = await retryConnect(() => RfbClient.connect({ host: '127.0.0.1', port, timeoutMs: 15000, ...options }), { label: 'capture' });
     try {
       // The first update is the whole screen; a second one flushes anything
       // the server split off (some encoders send large rects in pieces).
@@ -419,7 +445,7 @@ async function testWideDesktop() {
 
   const session = new VncSession({});
   try {
-    const status = await session.connect({ host: '127.0.0.1', port });
+    const status = await retryConnect(() => session.connect({ host: '127.0.0.1', port }));
     await test('a 1600px desktop is captured at 1280px by default', async () => {
       assertEqual(status.width, 1600, 'desktop width');
       const shot = await session.screenshot();
@@ -447,7 +473,7 @@ async function testPasswordDesktop() {
   await test('VNC authentication succeeds with the right password', async () => {
     const session = new VncSession({});
     try {
-      const status = await session.connect({ host: '127.0.0.1', port, password: PASSWORD });
+      const status = await retryConnect(() => session.connect({ host: '127.0.0.1', port, password: PASSWORD }));
       assertEqual(status.connected, true, 'should be connected');
       assertEqual(status.width, 1024, 'desktop width');
     } finally {
