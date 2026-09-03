@@ -1,39 +1,30 @@
 /**
- * A small RFB (VNC) client: enough of the protocol to keep a live copy of the
- * remote framebuffer and to inject pointer and keyboard events.
+ * An RFB (VNC) client: a live copy of the remote framebuffer, plus pointer and
+ * keyboard injection.
  *
- * Scope is deliberately narrow (DECISIONS.md #3, #4):
- *   - protocol versions 3.3, 3.7, 3.8
- *   - security types None (1) and VNC Authentication (2)
- *   - encodings Raw, CopyRect, and the DesktopSize pseudo-encoding
- *   - a pixel format we pin ourselves, so there is one decoding path
+ * Division of labour:
+ *   - transport, handshake and the message loop are here (~300 lines of
+ *     protocol that noVNC keeps inside its browser-only `RFB` class)
+ *   - byte buffering is noVNC's `Websock`
+ *   - every rectangle encoding is decoded by noVNC's own decoders, drawing into
+ *     `Framebuffer`, which mimics the five methods they use on a Display
  *
- * Everything left out (Tight, ZRLE, Hextile, TLS/VeNCrypt) buys compression or
- * transport security rather than capability, and each would cost more code than
- * the whole of this file.
+ * Supported: RFB 3.3 / 3.7 / 3.8; security `None` and `VNC Authentication`;
+ * encodings Tight, ZRLE, Hextile, RRE, Zlib, CopyRect, Raw, plus the
+ * DesktopSize, LastRect and DesktopName pseudo-encodings. See DECISIONS.md #3
+ * and #11 for what is left out and why.
  */
 
 import net from 'node:net';
-import { vncAuthResponse } from './novnc.js';
-
-// Client -> server message types.
-const MSG_SET_PIXEL_FORMAT = 0;
-const MSG_SET_ENCODINGS = 2;
-const MSG_FB_UPDATE_REQUEST = 3;
-const MSG_KEY_EVENT = 4;
-const MSG_POINTER_EVENT = 5;
-
-// Server -> client message types.
-const MSG_FB_UPDATE = 0;
-const MSG_SET_COLOUR_MAP = 1;
-const MSG_BELL = 2;
-const MSG_SERVER_CUT_TEXT = 3;
-
-// Encodings.
-const ENC_RAW = 0;
-const ENC_COPY_RECT = 1;
-const ENC_DESKTOP_SIZE = -223;
-const ENC_LAST_RECT = -224;
+import {
+  Websock,
+  encodings as E,
+  encodingName,
+  createDecoders,
+  decodeUTF8,
+  vncAuthResponse,
+} from './novnc.js';
+import { Framebuffer } from './framebuffer.js';
 
 const SEC_NONE = 1;
 const SEC_VNC_AUTH = 2;
@@ -49,112 +40,104 @@ export const BUTTONS = {
   wheelRight: 64,
 };
 
+/** Encodings the client can ask for, by the name used in options and stats. */
+const ENCODING_BY_NAME = {
+  copyrect: E.encodingCopyRect,
+  tight: E.encodingTight,
+  zrle: E.encodingZRLE,
+  hextile: E.encodingHextile,
+  rre: E.encodingRRE,
+  zlib: E.encodingZlib,
+  raw: E.encodingRaw,
+};
+
+/** Default preference order: best compression first; Raw is always implied. */
+const DEFAULT_ENCODINGS = ['copyrect', 'tight', 'zrle', 'hextile', 'rre', 'zlib', 'raw'];
+
 /**
- * Reads an exact number of bytes at a time from a socket, so the protocol can
- * be written as a straight-line async function instead of a state machine.
+ * A TCP socket dressed as the WebSocket-shaped channel noVNC's Websock
+ * attaches to. This is the whole reason no websockify is needed.
  */
-class ByteStream {
+class TcpChannel {
   constructor(socket) {
-    this._chunks = [];
-    this._length = 0;
-    this._pending = null; // { need, resolve, reject }
-    this._error = null;
+    this._socket = socket;
+    this.bytesReceived = 0;
+    // Own properties, because Websock.attach() checks for each by name.
+    this.binaryType = 'arraybuffer';
+    this.protocol = '';
+    this.readyState = 'open';
+    this.onmessage = null;
+    this.onopen = null;
+    this.onclose = null;
+    this.onerror = null;
 
     socket.on('data', (chunk) => {
-      this._chunks.push(chunk);
-      this._length += chunk.length;
-      this._settle();
+      this.bytesReceived += chunk.length;
+      this.onmessage?.({ data: chunk });
     });
-    socket.on('error', (err) => this._fail(err));
-    socket.on('close', () => this._fail(new Error('VNC connection closed by the server')));
-  }
-
-  _fail(err) {
-    if (this._error) return;
-    this._error = err;
-    if (this._pending) {
-      const { reject } = this._pending;
-      this._pending = null;
-      reject(err);
-    }
-  }
-
-  _settle() {
-    if (!this._pending || this._length < this._pending.need) return;
-    const { need, resolve } = this._pending;
-    this._pending = null;
-    resolve(this._take(need));
-  }
-
-  _take(n) {
-    const out = Buffer.allocUnsafe(n);
-    let offset = 0;
-    while (offset < n) {
-      const chunk = this._chunks[0];
-      const take = Math.min(chunk.length, n - offset);
-      chunk.copy(out, offset, 0, take);
-      offset += take;
-      if (take === chunk.length) this._chunks.shift();
-      else this._chunks[0] = chunk.subarray(take);
-    }
-    this._length -= n;
-    return out;
-  }
-
-  /** @returns {Promise<Buffer>} exactly `n` bytes */
-  read(n) {
-    if (n === 0) return Promise.resolve(Buffer.alloc(0));
-    if (this._length >= n) return Promise.resolve(this._take(n));
-    if (this._error) return Promise.reject(this._error);
-    if (this._pending) return Promise.reject(new Error('concurrent reads on the VNC socket'));
-    return new Promise((resolve, reject) => {
-      this._pending = { need: n, resolve, reject };
+    socket.on('error', (err) => this.onerror?.(err));
+    socket.on('close', () => {
+      this.readyState = 'closed';
+      this.onclose?.({ code: 1006, reason: 'socket closed' });
     });
   }
-}
 
-/**
- * The pixel format we ask the server for: 32 bits per pixel, depth 24, little
- * endian, true colour, with red at shift 16. Stored little endian that is
- * B, G, R, unused per pixel, which we unpack to RGBA.
- */
-function ourPixelFormat() {
-  const pf = Buffer.alloc(16);
-  pf.writeUInt8(32, 0); // bits per pixel
-  pf.writeUInt8(24, 1); // depth
-  pf.writeUInt8(0, 2); // big endian flag
-  pf.writeUInt8(1, 3); // true colour flag
-  pf.writeUInt16BE(255, 4); // red max
-  pf.writeUInt16BE(255, 6); // green max
-  pf.writeUInt16BE(255, 8); // blue max
-  pf.writeUInt8(16, 10); // red shift
-  pf.writeUInt8(8, 11); // green shift
-  pf.writeUInt8(0, 12); // blue shift
-  return pf;
+  send(data) {
+    // `data` is a view into Websock's send queue, which is reused immediately.
+    this._socket.write(Buffer.from(data));
+  }
+
+  close() {
+    this.readyState = 'closing';
+    this._socket.end();
+  }
 }
 
 export class RfbClient {
-  constructor(socket, stream) {
+  constructor(socket, options) {
     this._socket = socket;
-    this._stream = stream;
+    this._options = options;
+    this._channel = new TcpChannel(socket);
+    this._sock = new Websock();
+    this._sock.attach(this._channel);
+    this._sock.on('close', () => this._shutdown(new Error('VNC connection closed by the server')));
+    this._sock.on('error', (err) => this._shutdown(err instanceof Error ? err : new Error(String(err))));
 
-    /** @type {number} */ this.width = 0;
-    /** @type {number} */ this.height = 0;
+    /** @type {Framebuffer} */
+    this.fb = new Framebuffer();
     /** @type {string} */ this.name = '';
-    /** RGBA, `width * height * 4` bytes. @type {Buffer} */
-    this.framebuffer = Buffer.alloc(0);
+    /** Whatever the server last pushed as its clipboard. @type {string|null} */
+    this.clipboard = null;
 
     /** Bumped once per completed FramebufferUpdate, so callers can wait for one. */
     this.updateCount = 0;
-    /** Whatever the server last pushed as its clipboard, if anything. @type {string|null} */
-    this.clipboard = null;
+    /** Rectangles decoded so far, by encoding name: which one the server chose. */
+    this.stats = { updates: 0, rects: {} };
+    Object.defineProperty(this.stats, 'bytesReceived', { enumerable: true, get: () => this._channel.bytesReceived });
+
     this.closed = false;
     this.closeReason = null;
 
+    this._decoders = createDecoders();
+    this._update = { rects: 0, rect: null }; // FramebufferUpdate in progress
     this._buttonMask = 0;
     this._pointerX = 0;
     this._pointerY = 0;
+    this._dataWaiter = null;
     this._updateWaiters = [];
+  }
+
+  get width() {
+    return this.fb.width;
+  }
+
+  get height() {
+    return this.fb.height;
+  }
+
+  /** RGBA, `width * height * 4` bytes. Live: copy before holding on to it. */
+  get framebuffer() {
+    return this.fb.data;
   }
 
   /**
@@ -163,9 +146,12 @@ export class RfbClient {
    * @param {number} [options.port]
    * @param {string} [options.password]
    * @param {number} [options.timeoutMs]
+   * @param {string[]} [options.encodings] preference order, from ENCODING_BY_NAME
+   * @param {number} [options.quality] 0-9: allow lossy JPEG in Tight (unset = lossless)
+   * @param {number} [options.compression] 0-9 zlib level hint (default 2, like noVNC)
    * @returns {Promise<RfbClient>}
    */
-  static async connect({ host = '127.0.0.1', port = 5900, password = '', timeoutMs = 15000 } = {}) {
+  static async connect({ host = '127.0.0.1', port = 5900, password = '', timeoutMs = 15000, ...rest } = {}) {
     const socket = await new Promise((resolve, reject) => {
       const s = net.createConnection({ host, port });
       const timer = setTimeout(() => {
@@ -183,56 +169,84 @@ export class RfbClient {
       });
     });
 
-    const client = new RfbClient(socket, new ByteStream(socket));
+    const client = new RfbClient(socket, rest);
     try {
       await withTimeout(client._handshake(password), timeoutMs, 'VNC handshake');
     } catch (err) {
-      socket.destroy();
+      client._shutdown(err);
       throw err;
     }
-
-    // Run the message loop in the background; it feeds `framebuffer`.
-    client._pump().catch((err) => client._shutdown(err));
-    client._requestUpdate(false);
     return client;
+  }
+
+  // --- reading helpers -----------------------------------------------------
+
+  /** Resolve once at least `n` bytes are waiting in the receive queue. */
+  _need(n, what) {
+    if (this.closed) return Promise.reject(new Error(this.closeReason));
+    if (!this._sock.rQwait(what, n)) return Promise.resolve();
+    return new Promise((resolve, reject) => {
+      this._dataWaiter = { n, what, resolve, reject };
+    });
+  }
+
+  _onHandshakeData() {
+    const waiter = this._dataWaiter;
+    if (waiter && !this._sock.rQwait(waiter.what, waiter.n)) {
+      this._dataWaiter = null;
+      waiter.resolve();
+    }
+  }
+
+  async _readString(n) {
+    await this._need(n, 'string');
+    return this._sock.rQshiftStr(n);
   }
 
   // --- handshake -----------------------------------------------------------
 
   async _handshake(password) {
-    const banner = (await this._stream.read(12)).toString('ascii');
+    this._sock.on('message', () => this._onHandshakeData());
+
+    const banner = await this._readString(12);
     const match = /^RFB (\d{3})\.(\d{3})\n$/.exec(banner);
     if (!match) throw new Error(`not a VNC server: unexpected greeting ${JSON.stringify(banner)}`);
 
     const serverVersion = Number(match[1]) * 1000 + Number(match[2]);
-    // Speak the highest version we understand that the server also does.
     const version = serverVersion >= 3008 ? 3008 : serverVersion >= 3007 ? 3007 : 3003;
-    this._send(Buffer.from(`RFB 003.${String(version % 1000).padStart(3, '0')}\n`, 'ascii'));
+    this._sock.sQpushString(`RFB 003.${String(version % 1000).padStart(3, '0')}\n`);
+    this._sock.flush();
 
     const securityType = await this._negotiateSecurityType(version, password);
     await this._authenticate(version, securityType, password);
 
-    this._send(Buffer.from([1])); // ClientInit: share the desktop
+    this._sock.sQpush8(1); // ClientInit: share the desktop
+    this._sock.flush();
     await this._readServerInit();
 
-    this._send(Buffer.concat([Buffer.from([MSG_SET_PIXEL_FORMAT, 0, 0, 0]), ourPixelFormat()]));
-    this._sendEncodings([ENC_COPY_RECT, ENC_RAW, ENC_DESKTOP_SIZE]);
+    this._sendPixelFormat();
+    this._sendEncodings();
+
+    // Hand the socket over to the message loop, draining anything already here.
+    this._sock.on('message', () => this._processMessages());
+    this._requestUpdate(false);
+    this._processMessages();
   }
 
   async _negotiateSecurityType(version, password) {
     if (version === 3003) {
-      // The server dictates the security type outright in 3.3.
-      const type = (await this._stream.read(4)).readUInt32BE(0);
+      await this._need(4, 'security type');
+      const type = this._sock.rQshift32();
       if (type === 0) throw new Error(await this._readFailureReason());
       return type;
     }
 
-    const count = (await this._stream.read(1))[0];
+    await this._need(1, 'security type count');
+    const count = this._sock.rQshift8();
     if (count === 0) throw new Error(await this._readFailureReason());
-    const offered = [...(await this._stream.read(count))];
+    await this._need(count, 'security types');
+    const offered = [...this._sock.rQshiftBytes(count)];
 
-    // Prefer no authentication when the server allows it and we have no
-    // password to send; otherwise use VNC auth if it is on the menu.
     const wanted = password ? [SEC_VNC_AUTH, SEC_NONE] : [SEC_NONE, SEC_VNC_AUTH];
     const chosen = wanted.find((type) => offered.includes(type));
     if (chosen === undefined) {
@@ -241,7 +255,8 @@ export class RfbClient {
           'implements None (1) and VNC Authentication (2). See DECISIONS.md #3.',
       );
     }
-    this._send(Buffer.from([chosen]));
+    this._sock.sQpush8(chosen);
+    this._sock.flush();
     return chosen;
   }
 
@@ -252,15 +267,18 @@ export class RfbClient {
       if (!password) {
         throw new Error('the server requires a password (VNC Authentication) but none was given');
       }
-      const challenge = await this._stream.read(16);
-      this._send(vncAuthResponse(password, challenge));
-      expectSecurityResult = true; // sent for VNC auth in every protocol version
+      await this._need(16, 'auth challenge');
+      const challenge = this._sock.rQshiftBytes(16);
+      this._sock.sQpushBytes(vncAuthResponse(password, challenge));
+      this._sock.flush();
+      expectSecurityResult = true;
     } else if (securityType !== SEC_NONE) {
       throw new Error(`unsupported VNC security type ${securityType}`);
     }
 
     if (!expectSecurityResult) return;
-    const result = (await this._stream.read(4)).readUInt32BE(0);
+    await this._need(4, 'security result');
+    const result = this._sock.rQshift32();
     if (result === 0) return;
     if (version >= 3008) throw new Error(`VNC authentication failed: ${await this._readFailureReason()}`);
     throw new Error('VNC authentication failed (wrong password?)');
@@ -268,159 +286,240 @@ export class RfbClient {
 
   async _readFailureReason() {
     try {
-      const length = (await this._stream.read(4)).readUInt32BE(0);
-      return (await this._stream.read(length)).toString('utf8');
+      await this._need(4, 'reason length');
+      const length = this._sock.rQshift32();
+      return decodeUTF8(await this._readString(length), true);
     } catch {
       return 'the server refused the connection without giving a reason';
     }
   }
 
   async _readServerInit() {
-    const header = await this._stream.read(24);
-    this._resize(header.readUInt16BE(0), header.readUInt16BE(2));
-    const nameLength = header.readUInt32BE(20);
-    this.name = (await this._stream.read(nameLength)).toString('utf8');
+    await this._need(24, 'ServerInit');
+    const width = this._sock.rQshift16();
+    const height = this._sock.rQshift16();
+    this._sock.rQskipBytes(16); // the server's pixel format; we set our own
+    const nameLength = this._sock.rQshift32();
+    this.fb.resize(width, height);
+    this.name = decodeUTF8(await this._readString(nameLength), true);
+  }
+
+  /**
+   * 32 bits per pixel, depth 24, little endian, true colour, red in the low
+   * byte. In memory that is R, G, B, pad — exactly what noVNC's decoders
+   * produce and what Framebuffer stores, so no pixel gets converted twice.
+   */
+  _sendPixelFormat() {
+    const s = this._sock;
+    s.sQpush8(0); // SetPixelFormat
+    s.sQpush8(0);
+    s.sQpush8(0);
+    s.sQpush8(0);
+    s.sQpush8(32); // bits per pixel
+    s.sQpush8(24); // depth
+    s.sQpush8(0); // big-endian flag
+    s.sQpush8(1); // true-colour flag
+    s.sQpush16(255); // red max
+    s.sQpush16(255); // green max
+    s.sQpush16(255); // blue max
+    s.sQpush8(0); // red shift
+    s.sQpush8(8); // green shift
+    s.sQpush8(16); // blue shift
+    s.sQpush8(0);
+    s.sQpush8(0);
+    s.sQpush8(0);
+    s.flush();
+  }
+
+  _sendEncodings() {
+    const names = this._options.encodings ?? DEFAULT_ENCODINGS;
+    const list = names.map((name) => {
+      const encoding = ENCODING_BY_NAME[String(name).toLowerCase()];
+      if (encoding === undefined) {
+        throw new Error(`unknown encoding "${name}"; choose from ${Object.keys(ENCODING_BY_NAME).join(', ')}`);
+      }
+      return encoding;
+    });
+
+    const { quality, compression = 2 } = this._options;
+    list.push(E.pseudoEncodingCompressLevel0 + clamp(compression, 0, 9));
+    if (quality !== undefined && quality !== null) {
+      list.push(E.pseudoEncodingQualityLevel0 + clamp(quality, 0, 9));
+    }
+    list.push(E.pseudoEncodingDesktopSize, E.pseudoEncodingLastRect, E.pseudoEncodingDesktopName);
+
+    const s = this._sock;
+    s.sQpush8(2); // SetEncodings
+    s.sQpush8(0);
+    s.sQpush16(list.length);
+    for (const encoding of list) s.sQpush32(encoding);
+    s.flush();
   }
 
   // --- server messages -----------------------------------------------------
 
-  async _pump() {
-    for (;;) {
-      const type = (await this._stream.read(1))[0];
-      switch (type) {
-        case MSG_FB_UPDATE:
-          await this._readFramebufferUpdate();
-          this.updateCount += 1;
-          this._notifyUpdate();
-          // Keep exactly one update request outstanding, so the framebuffer
-          // tracks the desktop without us polling.
-          this._requestUpdate(true);
-          break;
-        case MSG_SET_COLOUR_MAP: {
-          // We asked for true colour, so this should never arrive; consume it.
-          const header = await this._stream.read(5);
-          await this._stream.read(header.readUInt16BE(3) * 6);
-          break;
+  /**
+   * Drain whatever the receive queue holds. Every step either completes a
+   * message or returns early with the queue positioned to resume, which is
+   * the convention noVNC's decoders follow too: "false" means "more bytes".
+   */
+  _processMessages() {
+    try {
+      while (!this.closed) {
+        if (this._update.rects > 0) {
+          if (!this._framebufferUpdate()) return;
+          continue;
         }
-        case MSG_BELL:
-          break;
-        case MSG_SERVER_CUT_TEXT: {
-          const header = await this._stream.read(7);
-          this.clipboard = (await this._stream.read(header.readUInt32BE(3))).toString('latin1');
-          break;
+        if (this._sock.rQwait('message type', 1)) return;
+        const type = this._sock.rQshift8();
+
+        let complete;
+        switch (type) {
+          case 0:
+            complete = this._framebufferUpdate();
+            break;
+          case 1:
+            complete = this._setColourMapEntries();
+            break;
+          case 2: // Bell
+            complete = true;
+            break;
+          case 3:
+            complete = this._serverCutText();
+            break;
+          default:
+            throw new Error(`unexpected message type ${type} from the VNC server`);
         }
-        default:
-          throw new Error(`unexpected message type ${type} from the VNC server`);
+        if (!complete) return;
+      }
+    } catch (err) {
+      this._shutdown(err);
+    }
+  }
+
+  _framebufferUpdate() {
+    const s = this._sock;
+    const update = this._update;
+
+    if (update.rects === 0) {
+      if (s.rQwait('update header', 3, 1)) return false; // 1: un-read the type byte
+      s.rQskipBytes(1);
+      update.rects = s.rQshift16();
+    }
+
+    while (update.rects > 0) {
+      if (!update.rect) {
+        if (s.rQwait('rectangle header', 12)) return false;
+        update.rect = {
+          x: s.rQshift16(),
+          y: s.rQshift16(),
+          width: s.rQshift16(),
+          height: s.rQshift16(),
+          encoding: s.rQshift32() | 0, // signed
+        };
+      }
+      if (!this._handleRect(update.rect)) return false;
+      update.rects -= 1;
+      update.rect = null;
+    }
+
+    this.updateCount += 1;
+    this.stats.updates += 1;
+    this._notifyUpdate(true);
+    // Keep exactly one request outstanding, so the framebuffer tracks the
+    // desktop without polling.
+    this._requestUpdate(true);
+    return true;
+  }
+
+  _handleRect(rect) {
+    const s = this._sock;
+    switch (rect.encoding) {
+      case E.pseudoEncodingLastRect:
+        this._update.rects = 1; // decremented to zero by the caller
+        return true;
+
+      case E.pseudoEncodingDesktopSize:
+        this.fb.resize(rect.width, rect.height);
+        return true;
+
+      case E.pseudoEncodingDesktopName: {
+        if (s.rQwait('desktop name length', 4)) return false;
+        const length = s.rQshift32();
+        if (s.rQwait('desktop name', length, 4)) return false;
+        this.name = decodeUTF8(s.rQshiftStr(length), true);
+        return true;
+      }
+
+      default: {
+        const decoder = this._decoders[rect.encoding];
+        if (!decoder) {
+          throw new Error(
+            `the server sent a ${encodingName(rect.encoding)} rectangle, which this client ` +
+              'did not ask for and cannot skip past',
+          );
+        }
+        const complete = decoder.decodeRect(rect.x, rect.y, rect.width, rect.height, s, this.fb, 24);
+        if (complete) {
+          const name = encodingName(rect.encoding);
+          this.stats.rects[name] = (this.stats.rects[name] ?? 0) + 1;
+        }
+        return complete;
       }
     }
   }
 
-  async _readFramebufferUpdate() {
-    const count = (await this._stream.read(3)).readUInt16BE(1);
-    for (let i = 0; count === 0xffff || i < count; i++) {
-      const header = await this._stream.read(12);
-      const x = header.readUInt16BE(0);
-      const y = header.readUInt16BE(2);
-      const w = header.readUInt16BE(4);
-      const h = header.readUInt16BE(6);
-      const encoding = header.readInt32BE(8);
-
-      if (encoding === ENC_RAW) await this._readRaw(x, y, w, h);
-      else if (encoding === ENC_COPY_RECT) await this._readCopyRect(x, y, w, h);
-      else if (encoding === ENC_DESKTOP_SIZE) this._resize(w, h);
-      else if (encoding === ENC_LAST_RECT) break;
-      else {
-        // Rectangle lengths are encoding-specific, so an unknown one means we
-        // no longer know where the next message starts.
-        throw new Error(
-          `the server used encoding ${encoding}, which this client did not ask for and ` +
-            'cannot skip past. See DECISIONS.md #3.',
-        );
-      }
-    }
+  _setColourMapEntries() {
+    // We asked for true colour, so this should never arrive; consume it.
+    const s = this._sock;
+    if (s.rQwait('colour map header', 5, 1)) return false;
+    s.rQskipBytes(3); // padding + first colour
+    const count = s.rQshift16();
+    if (s.rQwait('colour map', count * 6, 6)) return false;
+    s.rQskipBytes(count * 6);
+    return true;
   }
 
-  async _readRaw(x, y, w, h) {
-    if (w === 0 || h === 0) return;
-    const pixels = await this._stream.read(w * h * 4);
-    const { width, framebuffer } = this;
-    for (let row = 0; row < h; row++) {
-      let src = row * w * 4;
-      let dst = ((y + row) * width + x) * 4;
-      for (let col = 0; col < w; col++, src += 4, dst += 4) {
-        framebuffer[dst] = pixels[src + 2]; // R
-        framebuffer[dst + 1] = pixels[src + 1]; // G
-        framebuffer[dst + 2] = pixels[src]; // B
-        framebuffer[dst + 3] = 255;
-      }
-    }
-  }
-
-  async _readCopyRect(x, y, w, h) {
-    const src = await this._stream.read(4);
-    const srcX = src.readUInt16BE(0);
-    const srcY = src.readUInt16BE(2);
-    const { width, framebuffer } = this;
-    const rowBytes = w * 4;
-    // Copy away from the overlap so a shifted region does not smear itself.
-    const rows = srcY < y ? [...Array(h).keys()].reverse() : [...Array(h).keys()];
-    for (const row of rows) {
-      const from = ((srcY + row) * width + srcX) * 4;
-      const to = ((y + row) * width + x) * 4;
-      framebuffer.copy(framebuffer, to, from, from + rowBytes);
-    }
-  }
-
-  _resize(width, height) {
-    if (width === this.width && height === this.height) return;
-    const next = Buffer.alloc(width * height * 4);
-    // Keep whatever still fits, so a resize does not blank the screen.
-    const keepRows = Math.min(height, this.height);
-    const keepBytes = Math.min(width, this.width) * 4;
-    for (let row = 0; row < keepRows; row++) {
-      this.framebuffer.copy(next, row * width * 4, row * this.width * 4, row * this.width * 4 + keepBytes);
-    }
-    this.width = width;
-    this.height = height;
-    this.framebuffer = next;
+  _serverCutText() {
+    const s = this._sock;
+    if (s.rQwait('cut text header', 7, 1)) return false;
+    s.rQskipBytes(3);
+    const length = s.rQshift32();
+    if (s.rQwait('cut text', length, 8)) return false;
+    this.clipboard = s.rQshiftStr(length); // Latin-1 by protocol
+    return true;
   }
 
   // --- client messages -----------------------------------------------------
 
-  _send(buffer) {
-    if (this.closed) throw new Error(`VNC connection is closed: ${this.closeReason ?? 'no reason given'}`);
-    this._socket.write(buffer);
-  }
-
-  _sendEncodings(encodings) {
-    const message = Buffer.alloc(4 + encodings.length * 4);
-    message.writeUInt8(MSG_SET_ENCODINGS, 0);
-    message.writeUInt16BE(encodings.length, 2);
-    encodings.forEach((encoding, i) => message.writeInt32BE(encoding, 4 + i * 4));
-    this._send(message);
-  }
-
   _requestUpdate(incremental) {
     if (this.closed) return;
-    const message = Buffer.alloc(10);
-    message.writeUInt8(MSG_FB_UPDATE_REQUEST, 0);
-    message.writeUInt8(incremental ? 1 : 0, 1);
-    message.writeUInt16BE(this.width, 6);
-    message.writeUInt16BE(this.height, 8);
-    this._send(message);
+    const s = this._sock;
+    s.sQpush8(3); // FramebufferUpdateRequest
+    s.sQpush8(incremental ? 1 : 0);
+    s.sQpush16(0);
+    s.sQpush16(0);
+    s.sQpush16(this.fb.width);
+    s.sQpush16(this.fb.height);
+    s.flush();
+  }
+
+  _assertOpen() {
+    if (this.closed) throw new Error(`VNC connection is closed: ${this.closeReason ?? 'no reason given'}`);
   }
 
   /** Move the pointer and/or change which buttons are held. */
   pointerEvent(x, y, buttonMask) {
-    this._pointerX = clamp(Math.round(x), 0, Math.max(0, this.width - 1));
-    this._pointerY = clamp(Math.round(y), 0, Math.max(0, this.height - 1));
+    this._assertOpen();
+    this._pointerX = clamp(Math.round(x), 0, Math.max(0, this.fb.width - 1));
+    this._pointerY = clamp(Math.round(y), 0, Math.max(0, this.fb.height - 1));
     this._buttonMask = buttonMask;
-    const message = Buffer.alloc(6);
-    message.writeUInt8(MSG_POINTER_EVENT, 0);
-    message.writeUInt8(buttonMask, 1);
-    message.writeUInt16BE(this._pointerX, 2);
-    message.writeUInt16BE(this._pointerY, 4);
-    this._send(message);
+    const s = this._sock;
+    s.sQpush8(5); // PointerEvent
+    s.sQpush8(buttonMask);
+    s.sQpush16(this._pointerX);
+    s.sQpush16(this._pointerY);
+    s.flush();
   }
 
   get pointer() {
@@ -429,11 +528,13 @@ export class RfbClient {
 
   /** Press (`down`) or release a key, by X11 keysym. */
   keyEvent(keysym, down) {
-    const message = Buffer.alloc(8);
-    message.writeUInt8(MSG_KEY_EVENT, 0);
-    message.writeUInt8(down ? 1 : 0, 1);
-    message.writeUInt32BE(keysym >>> 0, 4);
-    this._send(message);
+    this._assertOpen();
+    const s = this._sock;
+    s.sQpush8(4); // KeyEvent
+    s.sQpush8(down ? 1 : 0);
+    s.sQpush16(0);
+    s.sQpush32(keysym >>> 0);
+    s.flush();
   }
 
   // --- waiting -------------------------------------------------------------
@@ -456,7 +557,7 @@ export class RfbClient {
     });
   }
 
-  _notifyUpdate(updated = true) {
+  _notifyUpdate(updated) {
     const waiters = this._updateWaiters;
     this._updateWaiters = [];
     for (const waiter of waiters) {
@@ -470,8 +571,12 @@ export class RfbClient {
     this.closed = true;
     this.closeReason = err?.message ?? 'closed';
     this._socket.destroy();
-    // Release anyone waiting, but as "nothing arrived" — the screen did not
-    // update, the connection went away.
+    if (this._dataWaiter) {
+      const { reject } = this._dataWaiter;
+      this._dataWaiter = null;
+      reject(err);
+    }
+    // Release anyone waiting, as "nothing arrived": the connection went away.
     this._notifyUpdate(false);
   }
 

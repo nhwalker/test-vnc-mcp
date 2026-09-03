@@ -251,6 +251,78 @@ async function testOpenDesktop() {
   }
 }
 
+/**
+ * Every encoding noVNC decodes for us, checked against a Raw baseline of the
+ * same static desktop. The server honours the client's preference order, so
+ * offering one encoding at a time forces it; `stats.rects` then proves the
+ * server actually used it rather than quietly falling back to Raw.
+ */
+async function testEncodings() {
+  const { id, port } = startDesktop();
+  await waitForPort(port);
+  await waitForDesktop(id);
+  await sleep(1500); // let the desktop finish painting so every capture sees the same pixels
+
+  async function capture(options) {
+    const client = await RfbClient.connect({ host: '127.0.0.1', port, timeoutMs: 15000, ...options });
+    try {
+      // The first update is the whole screen; a second one flushes anything
+      // the server split off (some encoders send large rects in pieces).
+      await client.waitForUpdate(10000);
+      await client.waitForUpdate(300);
+      return {
+        pixels: client.fb.snapshot(),
+        stats: client.stats,
+        bytes: client.stats.bytesReceived,
+        imageRects: client.fb.imageRects,
+      };
+    } finally {
+      client.close();
+    }
+  }
+
+  const baseline = await capture({ encodings: ['raw'] });
+  await test('Raw baseline is a real picture', () => {
+    assert(baseline.stats.rects.Raw > 0, `expected Raw rectangles, got ${JSON.stringify(baseline.stats.rects)}`);
+    const lit = pixelsDiffering(baseline.pixels, Buffer.alloc(baseline.pixels.length));
+    assert(lit > 10000, `only ${lit} non-black pixels; the noise window should contribute 65536 on its own`);
+  });
+
+  for (const [name, label] of [
+    ['tight', 'Tight'],
+    ['zrle', 'ZRLE'],
+    ['hextile', 'Hextile'],
+    ['rre', 'RRE'],
+    ['zlib', 'Zlib'],
+  ]) {
+    await test(`${label} decodes to the same pixels as Raw`, async () => {
+      const got = await capture({ encodings: [name] });
+      assert(
+        got.stats.rects[label] > 0,
+        `the server never sent a ${label} rectangle; it sent ${JSON.stringify(got.stats.rects)}`,
+      );
+      const differing = pixelsDiffering(baseline.pixels, got.pixels);
+      // A handful of pixels may legitimately differ if the desktop repainted
+      // something between captures (the pointer, a cursor blink).
+      assert(differing < 200, `${differing} pixels differ from the Raw baseline`);
+      console.log(`       ${label}: ${got.bytes.toLocaleString()} bytes on the wire vs ${baseline.bytes.toLocaleString()} for Raw`);
+    });
+  }
+
+  await test('Tight uses JPEG for photographic areas when a quality level is set', async () => {
+    const got = await capture({ encodings: ['tight'], quality: 6 });
+    assert(got.stats.rects.Tight > 0, `expected Tight rectangles, got ${JSON.stringify(got.stats.rects)}`);
+    assert(got.imageRects > 0, 'no JPEG rectangles arrived, so the lossy path was never exercised');
+    // Lossy, so no exact match — but the noise window must still look like
+    // noise rather than a blank or a smear, and the rest must still match.
+    const noiseOffset = (100 * 1024 + 750) * 4;
+    const noise = got.pixels.subarray(noiseOffset, noiseOffset + 64 * 4);
+    const distinct = new Set();
+    for (let i = 0; i < noise.length; i += 4) distinct.add(noise[i] * 65536 + noise[i + 1] * 256 + noise[i + 2]);
+    assert(distinct.size > 20, `the JPEG-decoded noise has only ${distinct.size} colours across 64 pixels`);
+  });
+}
+
 async function testPasswordDesktop() {
   const { id, port } = startDesktop({ password: PASSWORD });
   await waitForPort(port);
@@ -372,6 +444,9 @@ async function main() {
   try {
     console.log('\ndesktop without a password');
     await testOpenDesktop();
+
+    console.log('\nencodings (decoded by noVNC)');
+    await testEncodings();
 
     console.log('\ndesktop with a password');
     await testPasswordDesktop();

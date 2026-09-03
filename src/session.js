@@ -28,18 +28,26 @@ export class VncSession {
       host: env.VNC_HOST || '127.0.0.1',
       port: Number(env.VNC_PORT || 5900),
       password: env.VNC_PASSWORD || '',
+      // Unset means lossless. 0-9 lets the server use JPEG inside Tight for
+      // photographic areas, which is a large bandwidth saving on a slow link.
+      quality: env.VNC_QUALITY === undefined || env.VNC_QUALITY === '' ? undefined : Number(env.VNC_QUALITY),
     };
   }
 
   /** Open a connection, replacing any existing one. */
-  async connect({ host, port, password, timeoutMs = 15000 } = {}) {
+  async connect({ host, port, password, quality, encodings, timeoutMs = 15000 } = {}) {
     this.disconnect();
     const target = {
       host: host ?? this.defaults.host,
       port: port ?? this.defaults.port,
       password: password ?? this.defaults.password,
     };
-    this.client = await RfbClient.connect({ ...target, timeoutMs });
+    this.client = await RfbClient.connect({
+      ...target,
+      timeoutMs,
+      quality: quality ?? this.defaults.quality,
+      encodings,
+    });
     this.target = { host: target.host, port: target.port };
     // The first full framebuffer arrives asynchronously; without this a
     // screenshot taken immediately after connecting can be a blank screen.
@@ -84,13 +92,17 @@ export class VncSession {
       height: this.client.height,
       pointer: this.client.pointer,
       clipboard: this.client.clipboard,
+      /** Rectangles received per encoding: shows which one the server chose. */
+      encodings: this.client.stats.rects,
+      updates: this.client.stats.updates,
+      bytesReceived: this.client.stats.bytesReceived,
     };
   }
 
   /** @returns {Promise<{ png: Buffer, width: number, height: number, sourceWidth: number, sourceHeight: number }>} */
   async screenshot({ scale = 1, maxWidth } = {}) {
     const client = await this.ensureConnected();
-    const result = encodePng(client.framebuffer, client.width, client.height, { scale, maxWidth });
+    const result = encodePng(client.fb.snapshot(), client.width, client.height, { scale, maxWidth });
     return { ...result, sourceWidth: client.width, sourceHeight: client.height };
   }
 

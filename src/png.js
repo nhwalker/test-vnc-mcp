@@ -53,7 +53,7 @@ function downscale(rgba, srcWidth, srcHeight, width, height) {
 /**
  * Encode an RGBA framebuffer as a PNG.
  *
- * @param {Buffer} rgba
+ * @param {Buffer} rgba caller-owned copy with opaque alpha (see Framebuffer.snapshot)
  * @param {number} srcWidth
  * @param {number} srcHeight
  * @param {object} [options]
@@ -74,9 +74,7 @@ export function encodePng(rgba, srcWidth, srcHeight, { scale = 1, maxWidth } = {
 
   const png = new PNG({ width, height });
   png.data =
-    width === srcWidth && height === srcHeight
-      ? Buffer.from(rgba)
-      : downscale(rgba, srcWidth, srcHeight, width, height);
+    width === srcWidth && height === srcHeight ? rgba : downscale(rgba, srcWidth, srcHeight, width, height);
 
   return { png: PNG.sync.write(png), width, height };
 }

@@ -12,6 +12,7 @@ RUN apt-get update \
         xterm \
         xdotool \
         x11-utils \
+        feh \
     && rm -rf /var/lib/apt/lists/*
 
 ENV DISPLAY=:0
