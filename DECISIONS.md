@@ -151,6 +151,13 @@ encoded from the *full* framebuffer, so scaling never loses server-side state.
 **Why not `sharp`:** it would give smaller JPEGs and faster resizing, but it is a
 native module. Pure JS keeps `npm install` from needing a toolchain.
 
+**The last encode is cached.** Encoding is the slow part (pure-JS PNG at full
+size is on the order of 100 ms), and an agent often looks twice at a screen that
+has not changed. The framebuffer's update counter says exactly when the pixels
+last moved, so a second screenshot with the same options on the same update
+returns the previous bytes. The reply carries a `cached` flag so this is
+visible rather than magic.
+
 ---
 
 ## 6. One connection per server process
@@ -235,8 +242,23 @@ tests with a mocked socket will happily pass while the real thing is broken. The
 test covers both the no-password and password-protected paths, since VNC auth
 (the DES code above) is otherwise never exercised.
 
-**Not done:** unit tests for the RFB decoder in isolation. The end-to-end test
-covers the same code and there is a limited amount of it.
+**Since the decoders became noVNC's,** the only pixel code we own is
+`Framebuffer`, and it has unit tests (`test/framebuffer.test.mjs`, Node's
+built-in runner, no dependencies): overlapping copies in all four directions,
+rectangles hanging off every edge, the byte-offset contract of `blitImage`,
+JPEG decoding into place. Those are the cases a well-behaved server rarely
+produces, so waiting for the end-to-end test to catch them meant waiting for a
+hostile server.
+
+**CopyRect is exercised end to end** by scrolling the terminal: the test
+container's xterm echoes what is typed, forty-five lines scroll it, and x11vnc
+expresses a scroll as CopyRect (several hundred of them per run).
+The scrolled framebuffer is then compared with a fresh connection's view of the
+same screen, which is the server's own idea of the truth.
+
+**CI** runs both suites on every push and pull request (`.github/workflows/
+test.yml`). GitHub's Ubuntu runners ship Docker, so the end-to-end test runs
+there unchanged.
 
 ---
 

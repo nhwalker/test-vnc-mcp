@@ -174,6 +174,16 @@ async function testOpenDesktop() {
       assert(shot.data.length < pngBytes, `jpeg (${shot.data.length} bytes) should be smaller than png (${pngBytes})`);
     });
 
+    await test('an unchanged screen is not re-encoded', async () => {
+      const first = await session.screenshot({ quietMs: 0 });
+      const second = await session.screenshot({ quietMs: 0 });
+      assertEqual(second.cached, true, 'same screen, same options: served from the cache');
+      assert(second.data === first.data, 'the cached call returns the very same buffer');
+      const other = await session.screenshot({ quietMs: 0, maxWidth: 512 });
+      assertEqual(other.cached, false, 'different options: encoded afresh');
+      assertEqual(other.width, 512, 'and with the new options applied');
+    });
+
     await test('screenshots can be scaled down', async () => {
       const shot = await session.screenshot({ scale: 0.5 });
       assertEqual(shot.width, 512, 'scaled width');
@@ -256,6 +266,33 @@ async function testOpenDesktop() {
       assertEqual(inDesktop(id, ['cat', '/tmp/typed.txt']), 'hello vnc', 'the terminal should have read the typed line');
       const changed = pixelsDiffering(before, session.client.framebuffer);
       assert(changed > 100, `typing should have repainted the screen, but only ${changed} pixels changed`);
+    });
+
+    await test('scrolling the terminal arrives as CopyRect and matches a fresh connection', async () => {
+      // The terminal now echoes what it is sent, so a burst of lines scrolls
+      // it, and x11vnc expresses scrolls as CopyRect. That exercises our
+      // overlapping-copy code against the server's idea of the screen.
+      await session.move({ x: 200, y: 200, settleMs: 100 });
+      const before = session.client.stats.rects.CopyRect ?? 0;
+      for (let i = 0; i < 45; i++) {
+        await session.type({ text: `scroll line ${i}\n`, delayMs: 2, settleMs: 60 });
+      }
+      await session.client.waitForQuiet(200, 3000);
+      const copyRects = (session.client.stats.rects.CopyRect ?? 0) - before;
+      assert(copyRects > 0, `expected the server to use CopyRect for the scroll; encodings: ${JSON.stringify(session.client.stats.rects)}`);
+
+      // A fresh connection gets the true screen from scratch. Our scrolled
+      // copy must agree with it.
+      const fresh = await RfbClient.connect({ host: '127.0.0.1', port });
+      try {
+        await fresh.waitForUpdate(10000);
+        await fresh.waitForUpdate(300);
+        const differing = pixelsDiffering(session.client.fb.snapshot(), fresh.fb.snapshot());
+        assert(differing < 200, `${differing} pixels differ between the CopyRect-updated screen and a fresh capture (after ${copyRects} CopyRects)`);
+        console.log(`       ${copyRects} CopyRect rectangles applied; ${differing} pixels differ from a fresh capture`);
+      } finally {
+        fresh.close();
+      }
     });
 
     await test('key combinations resolve and send without error', async () => {

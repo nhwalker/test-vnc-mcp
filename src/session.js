@@ -60,6 +60,7 @@ export class VncSession {
     this.client.close();
     this.client = null;
     this.target = null;
+    this._lastShot = null;
     return true;
   }
 
@@ -110,8 +111,18 @@ export class VncSession {
   async screenshot({ scale, maxWidth, format, quality, quietMs = 100, maxWaitMs = 500 } = {}) {
     const client = await this.ensureConnected();
     const quiet = quietMs > 0 ? await client.waitForQuiet(quietMs, maxWaitMs) : true;
-    const result = encodeImage(client.fb.snapshot(), client.width, client.height, { scale, maxWidth, format, quality });
-    return { ...result, sourceWidth: client.width, sourceHeight: client.height, quiet };
+
+    // Encoding is the slow part (pure-JS PNG at full size is ~100ms), and an
+    // agent often looks twice at a screen that has not changed. The update
+    // counter says exactly when the pixels last moved, so reuse the last
+    // encode when nothing did and the options match.
+    const key = [client, client.updateCount, client.width, client.height, scale, maxWidth, format, quality].join('|');
+    const cached = this._lastShot?.key === key;
+    if (!cached) {
+      const result = encodeImage(client.fb.snapshot(), client.width, client.height, { scale, maxWidth, format, quality });
+      this._lastShot = { key, result };
+    }
+    return { ...this._lastShot.result, sourceWidth: client.width, sourceHeight: client.height, quiet, cached };
   }
 
   // --- pointer -------------------------------------------------------------

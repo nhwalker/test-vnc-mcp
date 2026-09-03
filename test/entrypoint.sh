@@ -11,9 +11,11 @@ for _ in $(seq 1 50); do
 done
 
 # A terminal that captures one line of typed text into a file, so the test can
-# assert on exactly what the X server received rather than on pixels.
+# assert on exactly what the X server received rather than on pixels. After
+# that it echoes whatever is typed, so typing many lines scrolls it — which is
+# what makes the server send CopyRect rectangles.
 xterm -geometry 100x35+0+0 -fa Monospace -fs 14 -bg black -fg green \
-    -e sh -c 'printf "type here: "; read -r line; printf "%s" "$line" > /tmp/typed.txt; sleep 86400' &
+    -e sh -c 'printf "type here: "; read -r line; printf "%s" "$line" > /tmp/typed.txt; exec cat' &
 
 # A window of random noise: the worst case for every encoding, and the one
 # thing that makes a Tight encoder reach for JPEG when a quality level is set.

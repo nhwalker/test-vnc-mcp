@@ -97,18 +97,24 @@ VNC server on localhost or a container network, not across the internet.
 
 ## Test
 
-The test builds a small container running Xvfb + x11vnc + xterm, connects to it,
-and checks the results against the X server itself — the pointer position comes
-back from `xdotool`, and typed text comes back from a file the terminal wrote.
-Each encoding is then forced in turn and its output compared pixel for pixel
-with Raw; a window of random noise on the desktop is what makes the lossy JPEG
-path fire.
-
 ```sh
-npm test
+npm test            # both suites
+npm run test:unit   # Framebuffer edge cases; no container needed
+npm run test:e2e    # the real thing, against a container
 ```
 
-Needs `docker` (or set `DOCKER_CLI=podman`). The image is built for you.
+The unit tests cover the one piece of pixel code this repository owns, the
+framebuffer: overlapping copies, clipping, JPEG decoding into place.
+
+The end-to-end test builds a small container running Xvfb + x11vnc + xterm,
+connects to it, and checks the results against the X server itself — the
+pointer position comes back from `xdotool`, and typed text comes back from a
+file the terminal wrote. Each encoding is then forced in turn and its output
+compared pixel for pixel with Raw; a window of random noise on the desktop is
+what makes the lossy JPEG path fire, and scrolling the terminal is what makes
+the server send CopyRect. It needs `docker` (or set `DOCKER_CLI=podman`); the
+image is built for you. The same suites run in GitHub Actions on every push and
+pull request.
 
 ## Trying it by hand
 
