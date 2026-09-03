@@ -122,6 +122,32 @@ async function waitForDesktop(id, timeoutMs = 30000) {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/**
+ * Only a connection-level failure is worth retrying. An auth failure (wrong or
+ * missing password) means the handshake got far enough to be answered, so it is
+ * a real result, not a race — those tests must see it, not a retry.
+ */
+const TRANSIENT = /closed by the server|ECONNRESET|ECONNREFUSED|EPIPE|timed out connecting|could not connect/i;
+
+/**
+ * Connect, retrying while a just-started server settles. x11vnc can drop or
+ * refuse the first RFB connection for a moment after its port is open and the
+ * desktop has mapped, which otherwise fails the whole suite on the first test.
+ */
+async function retryConnect(thunk, { attempts = 6, label = 'connect' } = {}) {
+  let lastError;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await thunk();
+    } catch (err) {
+      lastError = err;
+      if (!TRANSIENT.test(err.message)) throw err;
+      await sleep(250 * (i + 1));
+    }
+  }
+  throw new Error(`${label} failed after ${attempts} attempts: ${lastError.message}`, { cause: lastError });
+}
+
 /** How many pixels differ between two RGBA buffers. */
 function pixelsDiffering(a, b) {
   let differing = 0;
@@ -140,7 +166,7 @@ async function testOpenDesktop() {
 
   const session = new VncSession({});
   try {
-    const status = await session.connect({ host: '127.0.0.1', port });
+    const status = await retryConnect(() => session.connect({ host: '127.0.0.1', port }));
 
     await test('connects and reads the desktop geometry', () => {
       assertEqual(status.connected, true, 'should be connected');
@@ -172,6 +198,16 @@ async function testOpenDesktop() {
       assertEqual(image.height, 768, 'jpeg height');
       // The noise window makes PNG expensive; that is exactly when JPEG earns its keep.
       assert(shot.data.length < pngBytes, `jpeg (${shot.data.length} bytes) should be smaller than png (${pngBytes})`);
+    });
+
+    await test('an unchanged screen is not re-encoded', async () => {
+      const first = await session.screenshot({ quietMs: 0 });
+      const second = await session.screenshot({ quietMs: 0 });
+      assertEqual(second.cached, true, 'same screen, same options: served from the cache');
+      assert(second.data === first.data, 'the cached call returns the very same buffer');
+      const other = await session.screenshot({ quietMs: 0, maxWidth: 512 });
+      assertEqual(other.cached, false, 'different options: encoded afresh');
+      assertEqual(other.width, 512, 'and with the new options applied');
     });
 
     await test('screenshots can be scaled down', async () => {
@@ -258,6 +294,33 @@ async function testOpenDesktop() {
       assert(changed > 100, `typing should have repainted the screen, but only ${changed} pixels changed`);
     });
 
+    await test('scrolling the terminal arrives as CopyRect and matches a fresh connection', async () => {
+      // The terminal now echoes what it is sent, so a burst of lines scrolls
+      // it, and x11vnc expresses scrolls as CopyRect. That exercises our
+      // overlapping-copy code against the server's idea of the screen.
+      await session.move({ x: 200, y: 200, settleMs: 100 });
+      const before = session.client.stats.rects.CopyRect ?? 0;
+      for (let i = 0; i < 45; i++) {
+        await session.type({ text: `scroll line ${i}\n`, delayMs: 2, settleMs: 60 });
+      }
+      await session.client.waitForQuiet(200, 3000);
+      const copyRects = (session.client.stats.rects.CopyRect ?? 0) - before;
+      assert(copyRects > 0, `expected the server to use CopyRect for the scroll; encodings: ${JSON.stringify(session.client.stats.rects)}`);
+
+      // A fresh connection gets the true screen from scratch. Our scrolled
+      // copy must agree with it.
+      const fresh = await retryConnect(() => RfbClient.connect({ host: '127.0.0.1', port }), { label: 'fresh capture' });
+      try {
+        await fresh.waitForUpdate(10000);
+        await fresh.waitForUpdate(300);
+        const differing = pixelsDiffering(session.client.fb.snapshot(), fresh.fb.snapshot());
+        assert(differing < 200, `${differing} pixels differ between the CopyRect-updated screen and a fresh capture (after ${copyRects} CopyRects)`);
+        console.log(`       ${copyRects} CopyRect rectangles applied; ${differing} pixels differ from a fresh capture`);
+      } finally {
+        fresh.close();
+      }
+    });
+
     await test('key combinations resolve and send without error', async () => {
       // The terminal is done reading, so this only proves the keysym path is
       // wired up end to end; parseCombo covers the name resolution itself.
@@ -315,7 +378,7 @@ async function testEncodings() {
   await sleep(1500); // let the desktop finish painting so every capture sees the same pixels
 
   async function capture(options) {
-    const client = await RfbClient.connect({ host: '127.0.0.1', port, timeoutMs: 15000, ...options });
+    const client = await retryConnect(() => RfbClient.connect({ host: '127.0.0.1', port, timeoutMs: 15000, ...options }), { label: 'capture' });
     try {
       // The first update is the whole screen; a second one flushes anything
       // the server split off (some encoders send large rects in pieces).
@@ -382,7 +445,7 @@ async function testWideDesktop() {
 
   const session = new VncSession({});
   try {
-    const status = await session.connect({ host: '127.0.0.1', port });
+    const status = await retryConnect(() => session.connect({ host: '127.0.0.1', port }));
     await test('a 1600px desktop is captured at 1280px by default', async () => {
       assertEqual(status.width, 1600, 'desktop width');
       const shot = await session.screenshot();
@@ -410,7 +473,7 @@ async function testPasswordDesktop() {
   await test('VNC authentication succeeds with the right password', async () => {
     const session = new VncSession({});
     try {
-      const status = await session.connect({ host: '127.0.0.1', port, password: PASSWORD });
+      const status = await retryConnect(() => session.connect({ host: '127.0.0.1', port, password: PASSWORD }));
       assertEqual(status.connected, true, 'should be connected');
       assertEqual(status.width, 1024, 'desktop width');
     } finally {
