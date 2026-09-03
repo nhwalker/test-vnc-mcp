@@ -65,6 +65,7 @@ defaults read English and need no network.
 | --- | --- |
 | `vnc_screenshot` | Capture the desktop, once it has stopped changing. PNG by default, `format: "jpeg"` for heavy screens; shrunk to 1280px wide unless `maxWidth` says otherwise (0 = full size). |
 | `vnc_describe` | Describe the desktop as JSON: its flat-coloured regions (windows, bars, buttons) nested by containment, every line of text with its bounding box, and which rectangles changed since the last look. Coordinates are full-size desktop pixels. |
+| `vnc_describe_image` | The same analysis over a PNG or JPEG the client supplies — a screenshot taken earlier — with an optional `bbox` to analyse one part and a `scale` to map a shrunk screenshot's coordinates back to desktop pixels. Needs no connection. |
 | `vnc_click` | Click at a point. `button` is left/middle/right, `clicks: 2` double-clicks. |
 | `vnc_move` | Move the pointer without clicking, for hover states. |
 | `vnc_drag` | Press at one point, move, release at another. |
@@ -140,6 +141,22 @@ OCR; the result is cached until the screen changes. `text: false` gives the
 regions alone in about 150 ms. Set `quietMs` and `maxWaitMs` as for a
 screenshot.
 
+**Images the client already has.** `vnc_describe_image` runs the same
+regions-and-text analysis over a base64 PNG or JPEG passed in the call (a
+`data:` URL is fine), and needs no VNC connection at all. Two extra arguments
+make it fit the screenshots this server hands out: `bbox` analyses only that
+rectangle of the image, with results still in whole-image coordinates, so a
+client can zoom in on one dialog without re-sending or re-reading the rest; and
+`scale` multiplies every returned coordinate, so passing the factor a shrunk
+`vnc_screenshot` reported gives boxes in desktop pixels that `vnc_click` can
+use directly. The reply is the same shape as `vnc_describe` minus the parts
+that only make sense for a live desktop (`changedSince`, `quiet`, `cached`),
+with an `image` object in place of `desktop` recording the size, type, and any
+`bbox` and `scale` applied. A JPEG screenshot works, with one caveat seen in
+testing: the regions came back identical to the PNG's, and dark text on light
+backgrounds read as well, but the terminal's thin green-on-black text was not
+read at all from the JPEG. When text matters, analyse PNG.
+
 Text recognition runs as WebAssembly in a worker thread — nothing native, no
 toolchain — and reads English by default from language data installed with the
 package, so it works offline and writes nothing to disk. For other languages
@@ -176,7 +193,9 @@ redrawn rectangles merge and how far back the history reaches. Region
 detection, text recognition and the assembled description all run over
 `test/fixtures/desktop.png`, a rendered 1024×768 desktop with a terminal, a
 dialog and three buttons (its source is `desktop.html` beside it), expecting
-exactly the regions a person would name and the text on each of them.
+exactly the regions a person would name and the text on each of them. One test
+starts the real server over stdio and calls `vnc_describe_image` on that
+fixture through MCP, then checks that closing the pipe ends the process.
 
 The end-to-end test builds a small container running Xvfb + x11vnc + xterm,
 connects to it, and checks the results against the X server itself — the

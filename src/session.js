@@ -12,17 +12,14 @@
 import { RfbClient, BUTTONS, delay } from './rfb.js';
 import { keysymsForText, parseCombo } from './keys.js';
 import { encodeImage } from './image.js';
-import { findSurfaces } from './regions.js';
-import { Ocr, readSurfaces } from './ocr.js';
+import { Ocr } from './ocr.js';
+import { analyze } from './analyze.js';
 
 /** How long to wait for the desktop to repaint after input, by default. */
 const DEFAULT_SETTLE_MS = 250;
 
 /** Milliseconds between the keystrokes of `type`. */
 const DEFAULT_KEY_DELAY_MS = 12;
-
-/** A region's text is abridged past this many characters in the description; the lines are still all in `text`. */
-const REGION_TEXT_LIMIT = 300;
 
 export class VncSession {
   constructor(env = process.env) {
@@ -182,18 +179,10 @@ export class VncSession {
     const key = [client, update, width, height, regions, text, words].join('|');
     const cached = this._lastDescription?.key === key;
     if (!cached) {
-      const started = Date.now();
       // A copy: the framebuffer keeps changing underneath while OCR awaits.
       const rgba = client.fb.snapshot();
-      const surfaces = regions ? findSurfaces(rgba, width, height) : [];
-      const lines = text ? await readSurfaces(this.ocr, rgba, width, height, surfaces, { words }) : [];
-      const result = {
-        desktop: { width, height, update },
-        regions: surfaces.map((s) => describeRegion(s, lines, text)),
-        text: lines,
-        elapsedMs: Date.now() - started,
-      };
-      this._lastDescription = { key, result };
+      const analysis = await analyze(this.ocr, rgba, width, height, { regions, text, words });
+      this._lastDescription = { key, result: { desktop: { width, height, update }, ...analysis } };
     }
 
     const previous = since ?? this._lastLook;
@@ -326,36 +315,6 @@ export class VncSession {
       : `no screen change within ${settleMs}ms`;
     return `${description}; ${suffix}. Desktop is ${client.width}x${client.height}.`;
   }
-}
-
-/** One region of the description: the surface plus the text read from it. */
-function describeRegion(surface, lines, withText) {
-  const out = {
-    id: surface.id,
-    bbox: [surface.x, surface.y, surface.width, surface.height],
-    color: surface.color,
-    parent: surface.parent,
-    depth: surface.depth,
-  };
-  if (surface.hint) out.hint = surface.hint;
-  if (!withText) return out;
-
-  const own = lines.filter((l) => l.region === surface.id);
-  out.textLines = own.length;
-  if (own.length > 0) {
-    const joined = own.map((l) => l.text).join('\n');
-    out.text = joined.length > REGION_TEXT_LIMIT ? `${joined.slice(0, REGION_TEXT_LIMIT)}…` : joined;
-  }
-  // The one role text makes safe to guess: a small nested surface with a single
-  // line of text centred on it is very probably a button, tab or menu item. A
-  // title bar has one line too, but left-aligned, which is what the centring
-  // test is for.
-  if (!out.hint && surface.parent !== null && own.length === 1 && surface.height <= 48 && surface.width <= 320) {
-    const { bbox } = own[0];
-    const offCentre = Math.abs(bbox.x + bbox.width / 2 - (surface.x + surface.width / 2));
-    if (offCentre <= surface.width * 0.15) out.hint = 'button-like';
-  }
-  return out;
 }
 
 function buttonMask(name, message) {

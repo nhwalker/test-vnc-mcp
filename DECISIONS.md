@@ -481,6 +481,28 @@ reconnects, and is terminated on shutdown — including when the client closes
 stdin, which the server now listens for, because a live worker thread would
 otherwise keep the process alive after the client had gone.
 
+### The same analysis over an image the client supplies
+
+`vnc_describe_image` takes a base64 PNG or JPEG and runs the identical
+pipeline, so a client can analyse a screenshot it took earlier, or one from
+somewhere else entirely, without a connection. The pipeline was pulled out of
+`session.js` into `src/analyze.js` for this, so the two tools cannot drift.
+
+Two arguments exist because of how this server's own screenshots behave.
+`bbox` analyses one rectangle of the image while reporting results in
+whole-image coordinates: the caller has usually already looked at the
+screenshot and wants exact boxes for one dialog, not another read of the
+whole screen. `scale` multiplies every returned coordinate; `vnc_screenshot`
+shrinks to 1280 wide by default and reports the factor, and passing that
+factor back gives desktop-pixel boxes `vnc_click` can take directly. The
+offset is applied before the scale, since the box is in image pixels.
+
+The image type is read from the bytes, and a `mimeType` argument that
+disagrees is an error rather than a hint: a client that thinks it holds a
+JPEG but holds a PNG should hear about it. Images beyond 64 megapixels are
+refused before decoding; 4 bytes a pixel plus OCR is not something to do to a
+stdio server on request.
+
 ### Measured
 
 On the 1024×768 test desktop (a terminal, a dialog with three buttons, two
