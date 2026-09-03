@@ -125,22 +125,31 @@ hand-written decoder.)
 
 ---
 
-## 5. Screenshots: PNG via `pngjs`, with an optional `scale`
+## 5. Screenshots: PNG by default, JPEG on request, capped at 1280px wide
 
-**Chosen:** `pngjs` (pure JavaScript) to encode the framebuffer to PNG, plus a
-`scale` parameter (0 < scale ≤ 1) that box-filters the image down before
-encoding.
+**Chosen:** `pngjs` and `jpeg-js` (both pure JavaScript) encode the framebuffer;
+`format` picks between them, PNG being the default. Images are box-filtered down
+so they are at most `maxWidth` wide, **1280 by default** (`0` disables the cap),
+with `scale` as a further factor.
 
-**Why PNG:** it is lossless, so text on the desktop stays readable, which is what
-a model looking at a screenshot mostly needs.
+**Why PNG by default:** it is lossless, so text on the desktop stays readable,
+which is what a model looking at a screenshot mostly needs. On a typical desktop
+(flat colours, text) PNG is also small — the test desktop's terminal encodes to
+under 10 KB.
 
-**Why not `sharp`:** `sharp` would give much smaller JPEGs and faster resizing,
-but it is a native module. Pure JS keeps `npm install` from needing a toolchain.
+**Why JPEG exists:** photo- or video-heavy screens make PNG balloon. On the test
+desktop with its 256×256 noise window, the JPEG is a fraction of the PNG. The
+tool description tells the agent when to reach for it.
 
-**Why `scale` exists:** a 1280×800 PNG is a few hundred KB, and screenshots go to
-the model as base64. `scale` is the escape hatch when a full-resolution capture
-is more image than the task needs. Screenshots are always encoded from the *full*
-framebuffer the server sent us, so scaling never loses server-side state.
+**Why the default cap:** screenshots go to the model as base64, so their byte
+size is the dominant cost of using this server at all, and a full 1920×1080
+capture is easily a megabyte or more. 1280 keeps normal desktop text legible
+while roughly halving that; the reply always states the factor to multiply
+coordinates by, and the agent can ask for full size. Screenshots are always
+encoded from the *full* framebuffer, so scaling never loses server-side state.
+
+**Why not `sharp`:** it would give smaller JPEGs and faster resizing, but it is a
+native module. Pure JS keeps `npm install` from needing a toolchain.
 
 ---
 
@@ -204,6 +213,14 @@ repaint before returning. It returns text, not an image — the agent calls
 repainted" is the main source of flaky GUI automation. Returning an image from
 every input tool would be the other extreme: correct, but it would flood the
 context with near-identical screenshots.
+
+**And `vnc_screenshot` waits for the screen to go quiet.** Waiting for *one*
+update after a click is not enough: a real UI repaints in bursts, and a capture
+between two of them shows a half-drawn dialog. So the screenshot tool captures
+only once no update has arrived for `quietMs` (default 100 ms), giving up after
+`maxWaitMs` (default 1.5 s) and saying so in its reply. A screen that never
+stops changing — video, a clock — costs the full wait, which is bounded, rather
+than an error. `quietMs: 0` captures immediately.
 
 ---
 
@@ -308,6 +325,9 @@ Debian. Not done; it is the obvious next step if encrypted transport matters.
 - **One more `window` reader could appear** in a future noVNC release. The
   loader in `src/novnc.js` would fail at import with a clear message, and the
   fix is a property on the shim.
+- **noVNC is pinned to exactly `1.7.0`,** not `^1.7.0`. We import its internal
+  files by path, so a minor release that moves one would break a fresh install.
+  Upgrading is a deliberate step: bump the pin, run `npm test`.
 
 ### Measured
 

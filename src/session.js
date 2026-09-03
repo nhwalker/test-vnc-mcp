@@ -11,7 +11,7 @@
 
 import { RfbClient, BUTTONS, delay } from './rfb.js';
 import { keysymsForText, parseCombo } from './keys.js';
-import { encodePng } from './png.js';
+import { encodeImage } from './image.js';
 
 /** How long to wait for the desktop to repaint after input, by default. */
 const DEFAULT_SETTLE_MS = 250;
@@ -99,11 +99,19 @@ export class VncSession {
     };
   }
 
-  /** @returns {Promise<{ png: Buffer, width: number, height: number, sourceWidth: number, sourceHeight: number }>} */
-  async screenshot({ scale = 1, maxWidth } = {}) {
+  /**
+   * Capture the desktop. Waits first for the screen to stop changing
+   * (`quietMs` with no update, giving up after `maxWaitMs`), so a screenshot
+   * taken right after a click does not catch a half-drawn dialog.
+   *
+   * @returns {Promise<{ data: Buffer, mimeType: string, width: number, height: number,
+   *   sourceWidth: number, sourceHeight: number, quiet: boolean }>}
+   */
+  async screenshot({ scale, maxWidth, format, quality, quietMs = 100, maxWaitMs = 1500 } = {}) {
     const client = await this.ensureConnected();
-    const result = encodePng(client.fb.snapshot(), client.width, client.height, { scale, maxWidth });
-    return { ...result, sourceWidth: client.width, sourceHeight: client.height };
+    const quiet = quietMs > 0 ? await client.waitForQuiet(quietMs, maxWaitMs) : true;
+    const result = encodeImage(client.fb.snapshot(), client.width, client.height, { scale, maxWidth, format, quality });
+    return { ...result, sourceWidth: client.width, sourceHeight: client.height, quiet };
   }
 
   // --- pointer -------------------------------------------------------------

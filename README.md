@@ -57,7 +57,7 @@ the cost of lossless text. Unset means everything arrives pixel-exact.
 
 | Tool | What it does |
 | --- | --- |
-| `vnc_screenshot` | Capture the desktop as a PNG. `scale` (0.05–1) and `maxWidth` trade detail for size. |
+| `vnc_screenshot` | Capture the desktop, once it has stopped changing. PNG by default, `format: "jpeg"` for heavy screens; shrunk to 1280px wide unless `maxWidth` says otherwise (0 = full size). |
 | `vnc_click` | Click at a point. `button` is left/middle/right, `clicks: 2` double-clicks. |
 | `vnc_move` | Move the pointer without clicking, for hover states. |
 | `vnc_drag` | Press at one point, move, release at another. |
@@ -72,7 +72,10 @@ Coordinates are always pixels in the desktop's own full-size space. A scaled
 screenshot says so in its accompanying text and gives the factor to multiply by.
 
 After any input, the server waits briefly (`settleMs`, default 250 ms) for the
-desktop to repaint, so the next screenshot is not a stale one.
+desktop to repaint. `vnc_screenshot` then waits for the screen to be still for
+`quietMs` (default 100 ms, up to `maxWaitMs`, default 1.5 s) before capturing,
+so it does not catch a window half-drawn; if the screen never settles it
+captures anyway and says so.
 
 Key names are X11 keysym names, with the obvious short aliases accepted:
 `enter`, `esc`, `del`, `backspace`, `pgup`, `pgdn`, `space`, `up`/`down`/

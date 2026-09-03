@@ -557,6 +557,28 @@ export class RfbClient {
     });
   }
 
+  /**
+   * Resolve once no framebuffer update has arrived for `quietMs` in a row —
+   * the desktop has finished repainting — or give up after `maxWaitMs`.
+   *
+   * A screen that never stops changing (video, a clock) simply waits out
+   * `maxWaitMs`; that is a bounded cost, not an error.
+   *
+   * @returns {Promise<boolean>} true if the screen went quiet, false if it was
+   *   still changing when the time ran out
+   */
+  async waitForQuiet(quietMs, maxWaitMs) {
+    const deadline = Date.now() + maxWaitMs;
+    for (;;) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return false;
+      const updated = await this.waitForUpdate(Math.min(quietMs, remaining));
+      // No update for the whole window is "quiet"; no update for a shorter
+      // window that ran into the deadline is "gave up".
+      if (!updated) return remaining >= quietMs;
+    }
+  }
+
   _notifyUpdate(updated) {
     const waiters = this._updateWaiters;
     this._updateWaiters = [];

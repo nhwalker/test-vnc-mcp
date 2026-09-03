@@ -1,12 +1,18 @@
 /**
- * Framebuffer (RGBA) -> PNG, with optional downscaling.
+ * Framebuffer (RGBA) -> PNG or JPEG, with optional downscaling.
  *
- * PNG rather than JPEG because it is lossless, and screenshots are mostly read
- * for their text. `pngjs` rather than `sharp` because it is pure JavaScript, so
- * installing this server never needs a native toolchain (DECISIONS.md #5).
+ * Screenshots go to the model as base64, so their byte size is the dominant
+ * cost of using this server. Three levers, all here: a `maxWidth` cap (on by
+ * default), a `scale` factor, and JPEG output for screens where PNG bloats.
+ * Both encoders are pure JavaScript, so installing never needs a native
+ * toolchain (DECISIONS.md #5).
  */
 
+import jpeg from 'jpeg-js';
 import { PNG } from 'pngjs';
+
+/** Screenshots are shrunk to this width unless told otherwise. */
+export const DEFAULT_MAX_WIDTH = 1280;
 
 /**
  * Box-filter an RGBA image down to `width` x `height`.
@@ -51,30 +57,43 @@ function downscale(rgba, srcWidth, srcHeight, width, height) {
 }
 
 /**
- * Encode an RGBA framebuffer as a PNG.
+ * Encode an RGBA framebuffer as an image.
  *
  * @param {Buffer} rgba caller-owned copy with opaque alpha (see Framebuffer.snapshot)
  * @param {number} srcWidth
  * @param {number} srcHeight
  * @param {object} [options]
  * @param {number} [options.scale] 0 < scale <= 1
- * @param {number} [options.maxWidth] shrink further so the result is no wider than this
- * @returns {{ png: Buffer, width: number, height: number }}
+ * @param {number} [options.maxWidth] shrink so the result is no wider than this; 0 = no cap
+ * @param {'png'|'jpeg'} [options.format]
+ * @param {number} [options.quality] JPEG quality 1-100 (default 80)
+ * @returns {{ data: Buffer, mimeType: string, width: number, height: number }}
  */
-export function encodePng(rgba, srcWidth, srcHeight, { scale = 1, maxWidth } = {}) {
+export function encodeImage(
+  rgba,
+  srcWidth,
+  srcHeight,
+  { scale = 1, maxWidth = DEFAULT_MAX_WIDTH, format = 'png', quality = 80 } = {},
+) {
   if (srcWidth === 0 || srcHeight === 0) {
     throw new Error('the desktop has no size yet; nothing to capture');
   }
 
   let factor = Math.min(1, Math.max(0.01, scale));
-  if (maxWidth && srcWidth * factor > maxWidth) factor = maxWidth / srcWidth;
+  if (maxWidth > 0 && srcWidth * factor > maxWidth) factor = maxWidth / srcWidth;
 
   const width = Math.max(1, Math.round(srcWidth * factor));
   const height = Math.max(1, Math.round(srcHeight * factor));
+  const pixels = width === srcWidth && height === srcHeight ? rgba : downscale(rgba, srcWidth, srcHeight, width, height);
 
+  if (format === 'jpeg') {
+    const encoded = jpeg.encode({ width, height, data: pixels }, Math.min(100, Math.max(1, quality)));
+    return { data: encoded.data, mimeType: 'image/jpeg', width, height };
+  }
+  if (format !== 'png') {
+    throw new Error(`unknown image format "${format}"; use png or jpeg`);
+  }
   const png = new PNG({ width, height });
-  png.data =
-    width === srcWidth && height === srcHeight ? rgba : downscale(rgba, srcWidth, srcHeight, width, height);
-
-  return { png: PNG.sync.write(png), width, height };
+  png.data = pixels;
+  return { data: PNG.sync.write(png), mimeType: 'image/png', width, height };
 }

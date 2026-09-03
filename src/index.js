@@ -106,27 +106,52 @@ tool(
   {
     title: 'Screenshot the desktop',
     description:
-      'Capture the current desktop as a PNG. Use scale or maxWidth to trade detail for size ' +
-      'on a large desktop; coordinates for the input tools are always in full-size pixels.',
+      'Capture the current desktop. Waits briefly for the screen to stop changing first, so ' +
+      'it does not catch a half-drawn window. Images wider than 1280px are shrunk to fit by ' +
+      'default; the reply says the factor to multiply coordinates by. Use format "jpeg" for ' +
+      'photo- or video-heavy screens, where PNG gets large. Coordinates for the input tools ' +
+      'are always in full-size desktop pixels.',
     inputSchema: {
+      maxWidth: z
+        .number()
+        .int()
+        .min(0)
+        .optional()
+        .describe('Shrink so the image is at most this wide (default 1280). 0 means full size.'),
       scale: z.number().min(0.05).max(1).optional().describe('Shrink by this factor, 0.05 to 1 (default 1).'),
-      maxWidth: z.number().int().min(64).optional().describe('Shrink further so the image is at most this wide.'),
+      format: z.enum(['png', 'jpeg']).optional().describe('png (lossless, default) or jpeg (smaller).'),
+      quality: z.number().int().min(1).max(100).optional().describe('JPEG quality, 1-100 (default 80).'),
+      quietMs: z
+        .number()
+        .int()
+        .min(0)
+        .max(5000)
+        .optional()
+        .describe('Capture once the screen has been still for this long, in ms (default 100; 0 captures at once).'),
+      maxWaitMs: z
+        .number()
+        .int()
+        .min(0)
+        .max(30000)
+        .optional()
+        .describe('Give up waiting for stillness after this long and capture anyway (default 1500).'),
     },
     annotations: { readOnlyHint: true },
   },
-  async ({ scale, maxWidth }) => {
-    const shot = await session.screenshot({ scale, maxWidth });
+  async (args) => {
+    const shot = await session.screenshot(args);
     const scaled = shot.width !== shot.sourceWidth;
+    const notes = [
+      scaled
+        ? `Desktop is ${shot.sourceWidth}x${shot.sourceHeight}; this image is ${shot.width}x${shot.height}. ` +
+          `Multiply coordinates read off it by ${(shot.sourceWidth / shot.width).toFixed(3)}.`
+        : `Desktop is ${shot.sourceWidth}x${shot.sourceHeight} (image is full size).`,
+      shot.quiet ? '' : 'The screen was still changing when the capture was taken.',
+    ];
     return {
       content: [
-        { type: 'image', data: shot.png.toString('base64'), mimeType: 'image/png' },
-        {
-          type: 'text',
-          text: scaled
-            ? `Desktop is ${shot.sourceWidth}x${shot.sourceHeight}; this image is ${shot.width}x${shot.height}. ` +
-              `Multiply coordinates read off it by ${(shot.sourceWidth / shot.width).toFixed(3)}.`
-            : `Desktop is ${shot.sourceWidth}x${shot.sourceHeight} (image is full size).`,
-        },
+        { type: 'image', data: shot.data.toString('base64'), mimeType: shot.mimeType },
+        { type: 'text', text: notes.filter(Boolean).join(' ') },
       ],
     };
   },

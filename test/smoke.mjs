@@ -14,6 +14,7 @@ import { fileURLToPath } from 'node:url';
 import net from 'node:net';
 import path from 'node:path';
 import { PNG } from 'pngjs';
+import jpeg from 'jpeg-js';
 
 import { VncSession } from '../src/session.js';
 import { RfbClient } from '../src/rfb.js';
@@ -67,10 +68,11 @@ function buildImage() {
 }
 
 /** Start a desktop container and return the host port its VNC server is on. */
-function startDesktop({ password = '' } = {}) {
+function startDesktop({ password = '', screen = '1024x768x24' } = {}) {
   const id = docker([
     'run', '-d', '--rm',
     '-e', `VNC_PASSWORD=${password}`,
+    '-e', `SCREEN_SIZE=${screen}`,
     '-p', '127.0.0.1::5900',
     IMAGE,
   ]);
@@ -146,9 +148,11 @@ async function testOpenDesktop() {
       assertEqual(status.height, 768, 'desktop height');
     });
 
+    let pngBytes = 0;
     await test('screenshots decode as a full-size PNG', async () => {
       const shot = await session.screenshot();
-      const png = PNG.sync.read(shot.png);
+      assertEqual(shot.mimeType, 'image/png', 'default format');
+      const png = PNG.sync.read(shot.data);
       assertEqual(png.width, 1024, 'png width');
       assertEqual(png.height, 768, 'png height');
       // A black root window with a terminal on it is not a uniform image.
@@ -157,6 +161,17 @@ async function testOpenDesktop() {
         [...png.data].some((_, i) => i % 4 !== 3 && png.data[i] !== first[i % 4]),
         'the screenshot is a single flat colour, so nothing was decoded',
       );
+      pngBytes = shot.data.length;
+    });
+
+    await test('screenshots can be JPEG', async () => {
+      const shot = await session.screenshot({ format: 'jpeg', quality: 70 });
+      assertEqual(shot.mimeType, 'image/jpeg', 'mime type');
+      const image = jpeg.decode(shot.data);
+      assertEqual(image.width, 1024, 'jpeg width');
+      assertEqual(image.height, 768, 'jpeg height');
+      // The noise window makes PNG expensive; that is exactly when JPEG earns its keep.
+      assert(shot.data.length < pngBytes, `jpeg (${shot.data.length} bytes) should be smaller than png (${pngBytes})`);
     });
 
     await test('screenshots can be scaled down', async () => {
@@ -164,13 +179,37 @@ async function testOpenDesktop() {
       assertEqual(shot.width, 512, 'scaled width');
       assertEqual(shot.height, 384, 'scaled height');
       assertEqual(shot.sourceWidth, 1024, 'source width is still full size');
-      assertEqual(PNG.sync.read(shot.png).width, 512, 'scaled png width');
+      assertEqual(PNG.sync.read(shot.data).width, 512, 'scaled png width');
     });
 
     await test('maxWidth caps the screenshot size', async () => {
       const shot = await session.screenshot({ maxWidth: 320 });
       assertEqual(shot.width, 320, 'capped width');
       assertEqual(shot.height, 240, 'capped height keeps the aspect ratio');
+    });
+
+    await test('screenshots wait for the screen to go quiet, but not forever', async () => {
+      const client = session.client;
+
+      // A still desktop is quiet almost immediately.
+      let started = Date.now();
+      assertEqual(await client.waitForQuiet(100, 1500), true, 'a still screen should report quiet');
+      assert(Date.now() - started < 600, 'a still screen should not take long to report quiet');
+
+      // Simulate a screen that repaints every 40ms: never quiet for 100ms, so
+      // the wait must give up at the deadline and say so.
+      const churn = setInterval(() => client._notifyUpdate(true), 40);
+      try {
+        started = Date.now();
+        assertEqual(await client.waitForQuiet(100, 500), false, 'a churning screen should report not-quiet');
+        const took = Date.now() - started;
+        assert(took >= 450 && took < 1000, `should give up around the 500ms deadline, took ${took}ms`);
+      } finally {
+        clearInterval(churn);
+      }
+
+      const shot = await session.screenshot({ quietMs: 0 });
+      assertEqual(shot.quiet, true, 'quietMs 0 skips the wait and reports quiet');
     });
 
     await test('the pointer lands where it was told to', async () => {
@@ -323,6 +362,34 @@ async function testEncodings() {
   });
 }
 
+/** A desktop wider than the default cap, to see the cap actually apply. */
+async function testWideDesktop() {
+  const { id, port } = startDesktop({ screen: '1600x900x24' });
+  await waitForPort(port);
+  await waitForDesktop(id);
+
+  const session = new VncSession({});
+  try {
+    const status = await session.connect({ host: '127.0.0.1', port });
+    await test('a 1600px desktop is captured at 1280px by default', async () => {
+      assertEqual(status.width, 1600, 'desktop width');
+      const shot = await session.screenshot();
+      assertEqual(shot.width, 1280, 'capped width');
+      assertEqual(shot.height, 720, 'capped height keeps the aspect ratio');
+      assertEqual(shot.sourceWidth, 1600, 'source width is reported');
+      assertEqual(PNG.sync.read(shot.data).width, 1280, 'the encoded image is the capped size');
+    });
+
+    await test('maxWidth 0 gives the full-size image', async () => {
+      const shot = await session.screenshot({ maxWidth: 0 });
+      assertEqual(shot.width, 1600, 'full width');
+      assertEqual(shot.height, 900, 'full height');
+    });
+  } finally {
+    session.disconnect();
+  }
+}
+
 async function testPasswordDesktop() {
   const { id, port } = startDesktop({ password: PASSWORD });
   await waitForPort(port);
@@ -408,6 +475,17 @@ async function testMcpServer() {
       );
     });
 
+    await test('vnc_screenshot can return JPEG through the tool layer', async () => {
+      const result = await client.callTool({
+        name: 'vnc_screenshot',
+        arguments: { format: 'jpeg', maxWidth: 400, quietMs: 0 },
+      });
+      assert(!result.isError, `tool reported an error: ${JSON.stringify(result.content)}`);
+      const image = result.content.find((part) => part.type === 'image');
+      assertEqual(image.mimeType, 'image/jpeg', 'mime type');
+      assertEqual(jpeg.decode(Buffer.from(image.data, 'base64')).width, 400, 'jpeg width');
+    });
+
     await test('vnc_click reaches the desktop through the tool layer', async () => {
       const result = await client.callTool({ name: 'vnc_click', arguments: { x: 640, y: 480, settleMs: 100 } });
       assert(!result.isError, `tool reported an error: ${JSON.stringify(result.content)}`);
@@ -447,6 +525,9 @@ async function main() {
 
     console.log('\nencodings (decoded by noVNC)');
     await testEncodings();
+
+    console.log('\nwide desktop');
+    await testWideDesktop();
 
     console.log('\ndesktop with a password');
     await testPasswordDesktop();
