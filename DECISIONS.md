@@ -368,3 +368,134 @@ line of text, plus a 256×256 window of random noise), bytes on the wire:
 The noise window alone is 196,608 bytes of incompressible data, so Tight and
 ZRLE are spending almost nothing on the rest of the screen. Every lossless
 encoding produced pixels identical to Raw; the test insists on it.
+
+---
+
+## 12. Describing the screen as data: regions from pixels, text from Tesseract, changes from the protocol
+
+**Chosen:** a `vnc_describe` tool, separate from `vnc_screenshot`, returning
+JSON in full-size desktop coordinates: flat-colour regions nested by
+containment, every line of text with its box and confidence and the region it
+was read from, and the rectangles redrawn since the agent last looked. Three
+sources, assembled in `session.js` and cached per framebuffer update.
+
+**Why a separate tool:** a description costs about a second (OCR) and several
+kilobytes of JSON, and a capable vision model looking at a screenshot needs
+neither. Attaching it to every screenshot would tax the common case for the
+benefit of the rare one. Made separate, the two compose: a screenshot to
+understand the screen, a description to get exact coordinates off it, or a
+description alone for a model that cannot see.
+
+### Changes: from the protocol, not from pixels
+
+Every FramebufferUpdate names the rectangles it carries. `RfbClient` was already
+decoding them; it now also files their geometry (`src/damage.js`) under the
+update number, keeps the last 64 updates, and answers "what changed since
+update N" by merging. Touching rectangles merge — a scroll arrives as hundreds
+of one-line CopyRects and the agent wants "the terminal scrolled", not each
+line — and more than 32 collapse to their bounding box. A `pixelmatch`-style
+comparison of two screenshots was the obvious alternative and is strictly
+worse: it rediscovers, slowly and approximately, what the server already said.
+
+### Regions: connected components of flat colour
+
+A desktop is mostly flat colour — window bodies, title bars, panels, buttons —
+and each is a connected run of near-identical pixels whose bounding box is the
+region a person would point at. `src/regions.js` flood-fills the framebuffer
+into such components and keeps those at least 24×12 that cover at least half
+their bounding box; strokes of text, borders and the pointer fail one test or
+the other. Pixels are compared with the component's *seed* colour, not their
+neighbour's, so a gradient cannot be walked across one step at a time. Nesting
+is by containment, ids are in reading order. About 150 ms for 1024×768.
+
+**Alternative considered: recursive XY-cut** (the document-layout algorithm;
+`@makibm/layt` on npm does it). Prototyped: it found the big blocks but not
+buttons, and its per-region "dominant colour equals background" heuristic
+broke as soon as a child window's colour dominated its parent's band. The
+component approach found every window, bar and button on the test desktop with
+pixel-exact boxes in one pass. `layt` also depends on `sharp`, which #5 rules
+out.
+
+**Alternative considered: a model.** Microsoft's OmniParser — a YOLOv8 icon
+detector plus a Florence-2 captioner — is the state of the art here and there
+are community ONNX conversions runnable with `onnxruntime-node`. Rejected for
+now on three grounds: the detector is YOLOv8-derived and therefore AGPL-3.0,
+which this Unlicense repository should not absorb by accident; the ONNX
+conversion is unvetted (a dozen downloads); and `onnxruntime-node` ships
+prebuilt native binaries, which is not the toolchain problem #5 is about but
+is not pure JavaScript either. Icon detection is the real thing this design
+lacks, and it is a deliberate follow-up, not an oversight.
+
+**What regions will not find** is anything without a flat background: photos,
+gradients, wallpaper. That is reported as no region, which is correct, and OCR
+still runs over the bare screen.
+
+**Hints are deliberately thin.** `bar` for a strip across the whole screen;
+`button-like` for a small nested region with exactly one line of text centred
+on it (a title bar has one line too, but left-aligned). Nothing else is
+guessed. A fake accessibility tree with confident wrong roles would be worse
+than boxes and text.
+
+### Text: tesseract.js, per region, doubled
+
+`tesseract.js` runs Tesseract as WebAssembly in a worker thread: pure
+JavaScript as far as `npm install` is concerned, so #5's "no toolchain" holds.
+It is the one serious OCR available that way. It is also the largest
+dependency this project has by a wide margin (`tesseract.js-core` is about
+45 MB on disk), which is why it was a question put to the owner rather than a
+decision made here. Apache-2.0.
+
+Two findings from the prototype shaped `src/ocr.js`:
+
+- **OCR must run per region.** Whole-screen recognition of the test desktop
+  returned `"-rw-r--r-- 1 user user 220 Sep 3 14:30 notes.txt Save changes?"`
+  as one line: the terminal's listing and the dialog's title share a row of
+  pixels and Tesseract read straight across the gap. It also returned the
+  three buttons as `"| cancel || pontsave || save |"`. Each surface is
+  therefore cropped out, with the surfaces inside it painted over in its own
+  colour, and read alone; the buttons then read as exactly `Cancel`,
+  `Don't Save`, `Save`.
+- **Desktop text is small.** Tesseract expects print. At 14 px it read `ls` as
+  `1s`; doubled with nearest-neighbour (crisp, not smoothed — blur is the last
+  thing it needs) it did not, and dialog text went from 87% to 96%
+  confidence. Crops up to half a megapixel are doubled; larger ones are read
+  at 1× because doubling a whole screen costs more than it helps.
+
+Boxes come back at line level by default (word level on request; five times
+the output, noisier), mapped to desktop pixels. Lines below 30% confidence or
+with no letter or digit in them are dropped: borders read as `|`, scrollbars
+as `l`.
+
+**Language data is an npm dependency**, `@tesseract.js-data/eng`, and the
+worker is pointed at it. Left to its defaults tesseract.js downloads
+`eng.traineddata` from a CDN on first use and writes it to the process's
+current directory — for an MCP server, wherever the client happened to start
+it. With the data installed there is no network and nothing written. Other
+languages are `VNC_OCR_LANGS` plus a directory of their data. tesseract.js
+does not reliably reject when a language file is missing (the worker can sit
+forever), so the file is checked before the worker starts and the start has a
+timeout.
+
+**Lifecycle.** The worker starts on the first description, survives
+reconnects, and is terminated on shutdown — including when the client closes
+stdin, which the server now listens for, because a live worker thread would
+otherwise keep the process alive after the client had gone.
+
+### Measured
+
+On the 1024×768 test desktop (a terminal, a dialog with three buttons, two
+bars), this sandbox's CPU:
+
+| Step | Time |
+| --- | ---: |
+| OCR worker start (once per process) | ~300–700 ms |
+| Regions | ~150 ms |
+| Text, all regions, first look | ~1.5 s |
+| Regions only (`text: false`) | ~150 ms |
+| Second look at an unchanged screen | cached |
+
+| Reading | Whole screen, 1× | Per region, 2× |
+| --- | --- | --- |
+| Dialog title | `"‘Save changes?"` 87% | `"Save changes?"` 96% |
+| Buttons | `"\| cancel \|\| pontsave \|\| save \|"` | `"Cancel"` `"Don't Save"` `"Save"` 94–95% |
+| `$ ls -la` | `"$1s -la"` 62% | `"$ 1s -la"` 79% — still imperfect; green-on-black monospace at 14 px is hard |
