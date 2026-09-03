@@ -8,7 +8,8 @@ alternative was, so any of them can be reversed cheaply.
 
 ## 1. Language / runtime: Node.js (ESM), no build step
 
-**Chosen:** plain JavaScript ESM on Node 20+, run directly (`node src/index.js`).
+**Chosen:** plain JavaScript ESM on Node 22+, run directly (`node src/index.js`).
+(Originally 20+; section 11 explains the bump.)
 
 **Why:** the request was "keep it as simple as possible". noVNC — named in the
 request — is a JavaScript package, so Node keeps everything in one language with
@@ -21,9 +22,10 @@ dependency impossible.
 
 ---
 
-## 2. How noVNC is actually used: as a source of two DOM-free helpers, not as the VNC client
+## 2. How noVNC is used: its protocol internals, not its browser client
 
-This is the most important decision in the project, so it gets the most detail.
+This is the most important decision in the project. It was revised once; both
+versions are here because the reasoning in the first still holds.
 
 **The constraint:** noVNC's `RFB` class is a *browser* VNC client. It cannot run
 under Node. Verified directly:
@@ -34,74 +36,92 @@ ReferenceError: window is not defined
 ```
 
 It needs `window`, `document`, a `<canvas>` for its framebuffer, and a
-`WebSocket` (so it also needs a websockify TCP↔WebSocket bridge in front of any
-real VNC server). Making that work under Node means `jsdom` + the native
-`canvas` package + a WebSocket shim + websockify — four moving parts, a native
-build, and a framebuffer that lives in a fake DOM. That is the opposite of
-simple.
+`WebSocket` (so also a websockify TCP↔WebSocket bridge in front of any real VNC
+server). Making that work under Node means `jsdom` + the native `canvas` package
++ a WebSocket shim + websockify — four moving parts, a native build, and a
+framebuffer that lives in a fake DOM. That is the opposite of simple.
 
-**What I did instead:** this server speaks the RFB protocol directly over a TCP
-socket (`src/rfb.js`, ~400 lines), and imports from noVNC the two pieces that
-are pure logic with no DOM dependency:
+**First version (superseded):** speak RFB ourselves with only the `Raw` and
+`CopyRect` encodings, and import just two DOM-free pieces from noVNC:
+`crypto/des.js` (VNC password auth — Node's OpenSSL 3 build cannot do single
+DES; `createCipheriv('des-ecb', …)` throws `error:0308010C … unsupported`) and
+the `input/keysym*.js` tables (~1300 lines of X11 keysyms).
 
-| noVNC module | What it gives us | Why not hand-roll it |
-| --- | --- | --- |
-| `core/crypto/des.js` | DES-ECB for VNC password authentication | Node's own crypto **cannot** do single DES anymore: `crypto.createCipheriv('des-ecb', …)` throws `error:0308010C:digital envelope routines::unsupported` under OpenSSL 3's default provider. VNC auth also needs DES with LSB-first key bits, which noVNC's port already handles. |
-| `core/input/keysym.js`, `core/input/keysymdef.js` | Named X11 keysyms (`XK_Return`, `XK_Control_L`, …) and the Unicode→keysym table | ~1300 lines of generated lookup tables. Input injection is exactly what this table exists for. |
-
-So noVNC is a genuine helper library here — it does the two jobs that are
-annoying to redo — it just isn't the transport.
+**Current version:** the transport, handshake and message loop are still ours
+(`src/rfb.js`), but the byte buffering is noVNC's `Websock` and **every
+rectangle encoding is decoded by noVNC's own decoders**, drawing into a small
+`Framebuffer` class (`src/framebuffer.js`) that offers the five methods they
+call on noVNC's `Display`. Section 11 has the full evaluation of what could be
+reused, what was, and what was rejected.
 
 **One wrinkle worth knowing:** `@novnc/novnc`'s `package.json` declares
 `"exports": "./core/rfb.js"` (a bare string), so subpath imports like
-`@novnc/novnc/core/crypto/des.js` fail with `ERR_PACKAGE_PATH_NOT_EXPORTED`.
-`src/novnc.js` works around this by resolving the package's single public export
-with `import.meta.resolve()` and then walking to its sibling files. That is more
-robust than a hard-coded `node_modules/…` path (it survives pnpm and other
-non-flat layouts), but it is still reaching past a package boundary, and a future
-noVNC release could move those files. `src/novnc.js` fails loudly with an
+`@novnc/novnc/core/websock.js` fail with `ERR_PACKAGE_PATH_NOT_EXPORTED`.
+`src/novnc.js` resolves the package's single public export with
+`import.meta.resolve()` and walks to its sibling files. That survives pnpm and
+other non-flat layouts, but it is still reaching past a package boundary, and a
+future noVNC release could move those files. `src/novnc.js` fails loudly with an
 explanatory message if that happens, and it is the single place to fix.
 
-**Alternative considered and rejected:** drive noVNC for real inside the
-pre-installed headless Chromium (Playwright) — take page screenshots, inject
-input with `page.keyboard`/`page.mouse`. It genuinely uses noVNC as intended, but
-it needs websockify plus a browser process per session, and screenshots would be
-of a browser rendering of the desktop rather than the desktop's own pixels. Too
-much machinery for "as simple as possible".
+**Alternatives considered and rejected:** driving noVNC for real inside a
+browser — headless Chromium via Playwright, or Electron (which would also give a
+supervised window). Both genuinely use noVNC as intended, but both need a
+browser process per session, a display server on Linux (Electron's docs still
+require `$DISPLAY`; they recommend Xvfb), a two-process IPC topology, and
+screenshots taken from a browser's rendering rather than the desktop's own
+pixels. noVNC also has no public pointer-injection API, so input would either
+reach into `rfb._sock` or go through its DOM gesture heuristics. Section 11
+shows the Node route gets the decoders — the actual prize — for a fraction of
+that.
 
 ---
 
 ## 3. RFB feature scope: only what an agent actually needs
 
-**Chosen encodings:** `Raw`, `CopyRect`, and the `DesktopSize` pseudo-encoding.
+**Encodings offered, in preference order:** CopyRect, Tight, ZRLE, Hextile, RRE,
+Zlib, Raw — all decoded by noVNC (section 11). TightPNG and JPEG decoders are
+loaded too, so those rectangles decode if a server ever sends them, but they are
+not advertised.
 
-**Why:** Raw is mandatory in the RFB spec, so every server supports it and the
-decoder is ~15 lines. CopyRect is nearly as trivial and saves a lot of bandwidth
-on window drags and scrolls. DesktopSize lets us follow a resolution change
-instead of desynchronising.
+**Pseudo-encodings handled:** DesktopSize (follow a resolution change),
+LastRect, DesktopName, a compression-level hint (2, like noVNC), and a JPEG
+quality level only when `VNC_QUALITY` is set — unset means lossless, because
+screenshots are mostly read for their text.
 
-**Deliberately not implemented:** Tight, ZRLE, Hextile, TRLE. They are where the
-real complexity of a VNC client lives (zlib streams, palettes, JPEG sub-encoding)
-and they buy compression, not capability. On a loopback/LAN connection to a
-container — the intended use — Raw is fine. If a slow link ever matters, Hextile
-is the cheapest one to add next.
+**Deliberately not requested:**
+
+- *Cursor / VMware cursor.* With these the server stops drawing the pointer into
+  the framebuffer and sends its shape separately for the client to composite. We
+  want the pointer *in* the screenshot, so not asking keeps that the server's
+  job.
+- *ExtendedDesktopSize, ContinuousUpdates, Fence, ExtendedClipboard, QEMU
+  extended key and LED events, H.264.* Each is more protocol for a capability an
+  agent driving a desktop does not need yet. QEMU extended keys (scancodes) are
+  the most likely to be wanted, for VM consoles with non-US layouts; section 11
+  notes what it would take.
 
 **Protocol versions:** RFB 3.3, 3.7 and 3.8. **Security types:** `None` (1) and
 `VNC Authentication` (2). Not implemented: VeNCrypt, TLS, RA2, Tight auth, ARD.
 Encrypted VNC transports are a real gap, but the target is a VNC server on
-localhost or a container network, and adding TLS variants would roughly double
-the handshake code.
+localhost or a container network. Section 11 records which of these noVNC could
+supply and why they are not wired in.
 
 ---
 
-## 4. Pixel format: force 32-bit true colour, little-endian BGRX
+## 4. Pixel format: force 32-bit true colour, red in the low byte
 
 **Chosen:** the client sends `SetPixelFormat` to pin 32 bpp / depth 24 /
-little-endian / RGB max 255 with shifts R=16 G=8 B=0.
+little-endian / RGB max 255 with shifts R=0 G=8 B=16.
 
 **Why:** it means exactly one decoding path. Without it we would have to handle
 whatever the server offers — 8-bit palettes, 16-bit 565, big-endian — and each is
 a separate unpacking routine. Every server that matters honours `SetPixelFormat`.
+
+**Why this byte order:** it is the one noVNC negotiates, so its decoders emit
+R, G, B, pad — which is also how `Framebuffer` stores pixels. Decoded rectangles
+are copied into place without a second conversion. (The first version used
+B, G, R, pad and swapped bytes in the Raw decoder; that went away with the
+hand-written decoder.)
 
 ---
 
@@ -200,3 +220,109 @@ test covers both the no-password and password-protected paths, since VNC auth
 
 **Not done:** unit tests for the RFB decoder in isolation. The end-to-end test
 covers the same code and there is a limited amount of it.
+
+---
+
+## 11. Which parts of noVNC run under Node — the evaluation
+
+The question: how much of noVNC can we use directly, so that protocol code is
+maintained upstream rather than here? Answered by experiment, not by reading.
+
+### Method
+
+A script imported every file under noVNC's `core/` in Node and recorded what
+broke. First pass, no shims: 22 of 41 modules failed, all with
+`window is not defined`. Reading the failures, one module explained nearly all
+of them: `util/logging.js` binds `window.console` at import time, and almost
+everything imports the logger.
+
+Second pass, with `globalThis.window = { console, Error, crypto }` defined
+first — those three being the *only* things noVNC reads from `window` outside
+its DOM-bound modules (`util/logging.js` wants `console` and `Error`;
+`crypto/rsa.js` and `ra2.js` want `crypto.subtle` and `getRandomValues`, which
+Node's built-in WebCrypto provides). Result: **35 of 41 import cleanly**. The
+six that do not all need `document`: `rfb.js`, `display.js`,
+`input/keyboard.js`, `input/util.js`, `util/browser.js`, `util/cursor.js`,
+`util/events.js`.
+
+The shim is deliberately a three-property object, not an alias of `globalThis`,
+so nothing else in the process starts believing it is in a browser. Checked:
+none of our other dependencies branch on `typeof window` (only pngjs's unused
+browser entry point does).
+
+### Could `rfb.js` itself run, with a fake `document`?
+
+Tested with a logging Proxy standing in for `window`, `document` and
+`navigator`. Import fails on `MutationObserver` — but before getting there it
+had already read `document.body`, `document.documentElement`,
+`window.devicePixelRatio`, created an element to probe `style.cursor` support,
+and measured `offsetWidth`. That is layout and rendering behaviour, and the
+constructor would go on to need a working 2D canvas context, keyboard and
+cursor DOM handling, and gesture recognition. This is the jsdom-plus-canvas
+route by another name. **Rejected.** The handshake, security negotiation and
+message dispatch inside `rfb.js` therefore stay hand-written here (~300 lines
+of `src/rfb.js`, written from the RFB specification rather than copied).
+
+### What is used
+
+| noVNC module | Role here |
+| --- | --- |
+| `websock.js` | The receive/send queue. `attach()` accepts any object with a WebSocket-shaped surface, so a 30-line wrapper around a `net.Socket` replaces websockify. Every decoder is written against this buffer's `rQ*` methods. |
+| `decoders/raw, copyrect, rre, hextile, zlib, tight, tightpng, zrle, jpeg` | All rectangle decoding. Each imports only the logger and the inflator, and paints through five `Display` methods: `blitImage`, `fillRect`, `copyImage`, `imageRect`, `videoFrame`. `src/framebuffer.js` implements those over a plain RGBA buffer. |
+| `inflator.js` (+ vendored pako) | zlib streams, pulled in by the decoders. |
+| `encodings.js` | Encoding numbers and names. |
+| `crypto/des.js` | VNC password authentication. |
+| `input/keysym.js`, `input/keysymdef.js` | Key names and Unicode → keysym. |
+| `util/strings.js` | UTF-8 decoding of the desktop name. |
+
+`imageRect` is the one Display method whose browser implementation is not
+reproducible with a buffer — it hands JPEG/PNG bytes to `new Image()`. Here it
+decodes with `jpeg-js` (pure JavaScript, no dependencies, ~40 KB) and `pngjs`
+(already present). It is only exercised when a quality level is advertised;
+verified against real JPEG rectangles from x11vnc.
+
+### Importable but not wired in, and why
+
+| Module | What it offers | Why not (yet) |
+| --- | --- | --- |
+| `ra2.js` + `crypto/rsa.js`, `aes.js` | RealVNC's RA2/RA2ne authentication, as a self-contained `RSAAESAuthenticationState(sock, getCredentials)` that awaits socket data through `checkInternalEvents()`. Would slot into our handshake. | Needs a RealVNC server to test against, which is proprietary and cannot run in the test container. Also needs a policy for approving the server's public key (noVNC asks the user). Shipping untested auth would be worse than not shipping it. |
+| `crypto/dh.js`, `md5.js` | Building blocks for Apple Screen Sharing (ARD) and MSLogonII auth. | The negotiation sequences live in `rfb.js`, so they would be rewritten, not reused; and neither server is testable here. |
+| `input/xtscancodes.js`, `input/domkeytable.js` | The tables for QEMU Extended Key Events (scancodes), which fix non-US layouts on VM consoles. | We hold keysyms, and the tables are keyed by DOM `code`; getting keysym → code → scancode means inverting `domkeytable`. Modest, but no VM console to test with yet. |
+| `deflator.js`, `base64.js`, `util/int.js`, `util/eventtarget.js`, `input/gesturehandler.js`, `vkeys.js`, `fixedkeys.js` | — | No use in a non-browser client. |
+
+**A place Node beats the browser:** VeNCrypt's TLS subtypes (TLSVnc, X509Vnc,
+…) are impossible for noVNC — a browser cannot start TLS inside a WebSocket —
+but here they are `tls.connect()` over the existing socket followed by the
+normal inner auth, perhaps 40 lines, and testable with TigerVNC's `Xvnc` from
+Debian. Not done; it is the obvious next step if encrypted transport matters.
+
+### Other consequences
+
+- **Node ≥ 22.** `websock.js` reads `WebSocket.OPEN` and friends at import.
+  Node 22 ships the `WebSocket` global by default; Node 20 has it only behind a
+  flag.
+- **Licensing.** noVNC is MPL-2.0, whose copyleft is per-file. Importing its
+  modules as a dependency leaves this repository's Unlicense alone, as I
+  understand it; nothing was copied out of noVNC's files. Worth a glance from
+  whoever cares about licensing, since I am not the right authority.
+- **One more `window` reader could appear** in a future noVNC release. The
+  loader in `src/novnc.js` would fail at import with a clear message, and the
+  fix is a property on the shim.
+
+### Measured
+
+Full-screen first update of the 1024×768 test desktop (black terminal with a
+line of text, plus a 256×256 window of random noise), bytes on the wire:
+
+| Encoding | Bytes |
+| --- | ---: |
+| Raw | 3,145,800 |
+| RRE | 791,696 |
+| Hextile | 277,415 |
+| Zlib | 245,424 |
+| ZRLE | 203,186 |
+| Tight | 198,007 |
+
+The noise window alone is 196,608 bytes of incompressible data, so Tight and
+ZRLE are spending almost nothing on the rest of the screen. Every lossless
+encoding produced pixels identical to Raw; the test insists on it.

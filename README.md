@@ -4,10 +4,12 @@ An MCP server that lets an agent see and control a VNC desktop: screenshots in,
 mouse and keyboard out.
 
 It speaks the RFB protocol straight over TCP — no browser, no websockify, no
-native modules — and borrows [noVNC](https://github.com/novnc/noVNC) for the two
-pieces that are pure logic: the DES implementation that VNC password
-authentication needs, and the X11 keysym tables that input injection needs.
-`DECISIONS.md` explains why it is built this way.
+native modules — and runs the protocol-heavy parts of
+[noVNC](https://github.com/novnc/noVNC) under Node: its byte buffer, every one of
+its rectangle decoders (Tight, ZRLE, Hextile, RRE, Zlib, CopyRect, Raw), its DES
+for password authentication, and its X11 keysym tables. Only the transport,
+handshake and message loop are written here. `DECISIONS.md` explains how that
+works and what was evaluated.
 
 ## Install
 
@@ -15,7 +17,7 @@ authentication needs, and the X11 keysym tables that input injection needs.
 npm install
 ```
 
-Node 20 or newer. Nothing is compiled and there is no build step.
+Node 22 or newer. Nothing is compiled and there is no build step.
 
 ## Configure
 
@@ -43,9 +45,13 @@ Or as JSON, wherever your client keeps its server list:
 }
 ```
 
-The three environment variables are defaults, all optional. With them set the
-agent never has to name a host and never sees the password; without them it can
-point `vnc_connect` wherever it likes. VNC display `:N` is TCP port `5900 + N`.
+The environment variables are defaults, all optional. With them set the agent
+never has to name a host and never sees the password; without them it can point
+`vnc_connect` wherever it likes. VNC display `:N` is TCP port `5900 + N`.
+
+`VNC_QUALITY` (0–9) is a fourth, off by default: it lets the server use JPEG
+inside Tight for photographic areas, a large bandwidth saving on a slow link at
+the cost of lossless text. Unset means everything arrives pixel-exact.
 
 ## Tools
 
@@ -60,7 +66,7 @@ point `vnc_connect` wherever it likes. VNC display `:N` is TCP port `5900 + N`.
 | `vnc_key` | One key or shortcut: `"ctrl+c"`, `"alt+F4"`, `"Return"`, `"Escape"`, `"Up"`. |
 | `vnc_connect` | Point at a different desktop. Rarely needed — the first tool call connects on its own. |
 | `vnc_disconnect` | Close the connection. |
-| `vnc_status` | Connection state, desktop size and name, pointer position. |
+| `vnc_status` | Connection state, desktop size and name, pointer position, last clipboard text, and which encodings the server has been sending. |
 
 Coordinates are always pixels in the desktop's own full-size space. A scaled
 screenshot says so in its accompanying text and gives the factor to multiply by.
@@ -77,10 +83,12 @@ Key names are X11 keysym names, with the obvious short aliases accepted:
 
 - RFB protocol versions 3.3, 3.7 and 3.8
 - Security: `None` and `VNC Authentication` (password)
-- Encodings: `Raw`, `CopyRect`, and the `DesktopSize` pseudo-encoding
+- Encodings: Tight (including JPEG when `VNC_QUALITY` is set), ZRLE, Hextile,
+  RRE, Zlib, CopyRect, Raw; DesktopSize, LastRect and DesktopName
+  pseudo-encodings
 
-Not supported: Tight, ZRLE and Hextile (compression, not capability), and the
-encrypted transports (VeNCrypt, TLS, RA2). **Traffic is unencrypted**, and VNC
+Not supported: the encrypted transports and vendor authentication schemes
+(VeNCrypt/TLS, RealVNC RA2, Apple ARD). **Traffic is unencrypted**, and VNC
 passwords are capped at 8 characters by the protocol itself — this is meant for a
 VNC server on localhost or a container network, not across the internet.
 
@@ -89,6 +97,9 @@ VNC server on localhost or a container network, not across the internet.
 The test builds a small container running Xvfb + x11vnc + xterm, connects to it,
 and checks the results against the X server itself — the pointer position comes
 back from `xdotool`, and typed text comes back from a file the terminal wrote.
+Each encoding is then forced in turn and its output compared pixel for pixel
+with Raw; a window of random noise on the desktop is what makes the lossy JPEG
+path fire.
 
 ```sh
 npm test
