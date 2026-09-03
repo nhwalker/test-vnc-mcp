@@ -218,7 +218,7 @@ context with near-identical screenshots.
 update after a click is not enough: a real UI repaints in bursts, and a capture
 between two of them shows a half-drawn dialog. So the screenshot tool captures
 only once no update has arrived for `quietMs` (default 100 ms), giving up after
-`maxWaitMs` (default 1.5 s) and saying so in its reply. A screen that never
+`maxWaitMs` (default 0.5 s) and saying so in its reply. A screen that never
 stops changing — video, a clock — costs the full wait, which is bounded, rather
 than an error. `quietMs: 0` captures immediately.
 

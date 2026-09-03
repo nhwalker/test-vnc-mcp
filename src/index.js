@@ -134,7 +134,7 @@ tool(
         .min(0)
         .max(30000)
         .optional()
-        .describe('Give up waiting for stillness after this long and capture anyway (default 1500).'),
+        .describe('Give up waiting for stillness after this long and capture anyway (default 500).'),
     },
     annotations: { readOnlyHint: true },
   },

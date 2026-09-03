@@ -107,7 +107,7 @@ export class VncSession {
    * @returns {Promise<{ data: Buffer, mimeType: string, width: number, height: number,
    *   sourceWidth: number, sourceHeight: number, quiet: boolean }>}
    */
-  async screenshot({ scale, maxWidth, format, quality, quietMs = 100, maxWaitMs = 1500 } = {}) {
+  async screenshot({ scale, maxWidth, format, quality, quietMs = 100, maxWaitMs = 500 } = {}) {
     const client = await this.ensureConnected();
     const quiet = quietMs > 0 ? await client.waitForQuiet(quietMs, maxWaitMs) : true;
     const result = encodeImage(client.fb.snapshot(), client.width, client.height, { scale, maxWidth, format, quality });

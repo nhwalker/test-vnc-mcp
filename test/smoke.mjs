@@ -210,6 +210,18 @@ async function testOpenDesktop() {
 
       const shot = await session.screenshot({ quietMs: 0 });
       assertEqual(shot.quiet, true, 'quietMs 0 skips the wait and reports quiet');
+
+      // With the defaults, a churning screen costs about the 500ms cap and no more.
+      const churnAgain = setInterval(() => client._notifyUpdate(true), 40);
+      try {
+        started = Date.now();
+        const capped = await session.screenshot();
+        const took = Date.now() - started;
+        assertEqual(capped.quiet, false, 'the default wait should report the screen was still changing');
+        assert(took >= 450 && took < 1000, `default maxWaitMs should be ~500ms, took ${took}ms`);
+      } finally {
+        clearInterval(churnAgain);
+      }
     });
 
     await test('the pointer lands where it was told to', async () => {

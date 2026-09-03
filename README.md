@@ -73,7 +73,7 @@ screenshot says so in its accompanying text and gives the factor to multiply by.
 
 After any input, the server waits briefly (`settleMs`, default 250 ms) for the
 desktop to repaint. `vnc_screenshot` then waits for the screen to be still for
-`quietMs` (default 100 ms, up to `maxWaitMs`, default 1.5 s) before capturing,
+`quietMs` (default 100 ms, up to `maxWaitMs`, default 0.5 s) before capturing,
 so it does not catch a window half-drawn; if the screen never settles it
 captures anyway and says so.
 
