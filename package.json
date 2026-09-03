@@ -16,7 +16,7 @@
   "scripts": {
     "start": "node src/index.js",
     "test": "npm run test:unit && npm run test:e2e",
-    "test:unit": "node --test test/framebuffer.test.mjs",
+    "test:unit": "node --test test/*.test.mjs",
     "test:e2e": "node test/smoke.mjs"
   },
   "license": "Unlicense",

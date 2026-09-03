@@ -12,12 +12,17 @@
 import { RfbClient, BUTTONS, delay } from './rfb.js';
 import { keysymsForText, parseCombo } from './keys.js';
 import { encodeImage } from './image.js';
+import { findSurfaces } from './regions.js';
+import { Ocr, readSurfaces } from './ocr.js';
 
 /** How long to wait for the desktop to repaint after input, by default. */
 const DEFAULT_SETTLE_MS = 250;
 
 /** Milliseconds between the keystrokes of `type`. */
 const DEFAULT_KEY_DELAY_MS = 12;
+
+/** A region's text is abridged past this many characters in the description; the lines are still all in `text`. */
+const REGION_TEXT_LIMIT = 300;
 
 export class VncSession {
   constructor(env = process.env) {
@@ -32,6 +37,14 @@ export class VncSession {
       // photographic areas, which is a large bandwidth saving on a slow link.
       quality: env.VNC_QUALITY === undefined || env.VNC_QUALITY === '' ? undefined : Number(env.VNC_QUALITY),
     };
+    /** Text recognition; its worker thread starts on the first describe() and outlives reconnects. */
+    this.ocr = new Ocr({
+      ...(env.VNC_OCR_LANGS ? { langs: env.VNC_OCR_LANGS } : {}),
+      ...(env.VNC_OCR_LANG_PATH ? { langPath: env.VNC_OCR_LANG_PATH } : {}),
+    });
+    /** Update number of the last screenshot or description handed out, for "what changed since". */
+    this._lastLook = null;
+    this._describing = Promise.resolve();
   }
 
   /** Open a connection, replacing any existing one. */
@@ -61,7 +74,15 @@ export class VncSession {
     this.client = null;
     this.target = null;
     this._lastShot = null;
+    this._lastDescription = null;
+    this._lastLook = null;
     return true;
+  }
+
+  /** Disconnect and release everything, including the OCR worker. For shutdown. */
+  async close() {
+    this.disconnect();
+    await this.ocr.terminate();
   }
 
   /**
@@ -122,7 +143,70 @@ export class VncSession {
       const result = encodeImage(client.fb.snapshot(), client.width, client.height, { scale, maxWidth, format, quality });
       this._lastShot = { key, result };
     }
+    this._lastLook = client.updateCount;
     return { ...this._lastShot.result, sourceWidth: client.width, sourceHeight: client.height, quiet, cached };
+  }
+
+  /**
+   * Describe the desktop as data rather than pixels: its flat-colour regions
+   * (windows, panels, buttons), every line of text with its position, and
+   * which parts of the screen changed since the agent last looked. All
+   * coordinates are full-size desktop pixels — the ones the input tools take.
+   *
+   * Regions and text are expensive (OCR runs per region, about a second for a
+   * typical desktop), so they are cached per framebuffer update like
+   * screenshots are. The change report is free: it comes from the protocol.
+   *
+   * @param {object} [options]
+   * @param {number} [options.quietMs] as for screenshot()
+   * @param {number} [options.maxWaitMs] as for screenshot()
+   * @param {number} [options.since] report changes since this update number
+   *   (default: since the previous screenshot or description)
+   * @param {boolean} [options.regions] find regions (default true)
+   * @param {boolean} [options.text] read text (default true)
+   * @param {boolean} [options.words] include word boxes as well as lines (default false)
+   */
+  describe(options = {}) {
+    // One description at a time: two would race for the OCR worker and the cache.
+    const run = this._describing.then(() => this._describe(options));
+    this._describing = run.catch(() => {});
+    return run;
+  }
+
+  async _describe({ quietMs = 100, maxWaitMs = 500, since, regions = true, text = true, words = false } = {}) {
+    const client = await this.ensureConnected();
+    const quiet = quietMs > 0 ? await client.waitForQuiet(quietMs, maxWaitMs) : true;
+    const update = client.updateCount;
+    const { width, height } = client;
+
+    const key = [client, update, width, height, regions, text, words].join('|');
+    const cached = this._lastDescription?.key === key;
+    if (!cached) {
+      const started = Date.now();
+      // A copy: the framebuffer keeps changing underneath while OCR awaits.
+      const rgba = client.fb.snapshot();
+      const surfaces = regions ? findSurfaces(rgba, width, height) : [];
+      const lines = text ? await readSurfaces(this.ocr, rgba, width, height, surfaces, { words }) : [];
+      const result = {
+        desktop: { width, height, update },
+        regions: surfaces.map((s) => describeRegion(s, lines, text)),
+        text: lines,
+        elapsedMs: Date.now() - started,
+      };
+      this._lastDescription = { key, result };
+    }
+
+    const previous = since ?? this._lastLook;
+    let changedSince = null;
+    if (previous !== undefined && previous !== null && previous < update) {
+      const { complete, rects } = client.damageSince(previous);
+      changedSince = { update: previous, complete, rects: complete ? rects : [{ x: 0, y: 0, width, height }] };
+    } else if (previous === update) {
+      changedSince = { update: previous, complete: true, rects: [] };
+    }
+    this._lastLook = update;
+
+    return { ...this._lastDescription.result, changedSince, quiet, cached };
   }
 
   // --- pointer -------------------------------------------------------------
@@ -242,6 +326,36 @@ export class VncSession {
       : `no screen change within ${settleMs}ms`;
     return `${description}; ${suffix}. Desktop is ${client.width}x${client.height}.`;
   }
+}
+
+/** One region of the description: the surface plus the text read from it. */
+function describeRegion(surface, lines, withText) {
+  const out = {
+    id: surface.id,
+    bbox: [surface.x, surface.y, surface.width, surface.height],
+    color: surface.color,
+    parent: surface.parent,
+    depth: surface.depth,
+  };
+  if (surface.hint) out.hint = surface.hint;
+  if (!withText) return out;
+
+  const own = lines.filter((l) => l.region === surface.id);
+  out.textLines = own.length;
+  if (own.length > 0) {
+    const joined = own.map((l) => l.text).join('\n');
+    out.text = joined.length > REGION_TEXT_LIMIT ? `${joined.slice(0, REGION_TEXT_LIMIT)}…` : joined;
+  }
+  // The one role text makes safe to guess: a small nested surface with a single
+  // line of text centred on it is very probably a button, tab or menu item. A
+  // title bar has one line too, but left-aligned, which is what the centring
+  // test is for.
+  if (!out.hint && surface.parent !== null && own.length === 1 && surface.height <= 48 && surface.width <= 320) {
+    const { bbox } = own[0];
+    const offCentre = Math.abs(bbox.x + bbox.width / 2 - (surface.x + surface.width / 2));
+    if (offCentre <= surface.width * 0.15) out.hint = 'button-like';
+  }
+  return out;
 }
 
 function buttonMask(name, message) {

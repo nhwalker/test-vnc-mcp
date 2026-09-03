@@ -190,6 +190,38 @@ async function testOpenDesktop() {
       pngBytes = shot.data.length;
     });
 
+    await test('the description finds the terminal, reads its prompt, and ignores the noise', async () => {
+      const d = await session.describe();
+      assertEqual(d.desktop.width, 1024, 'desktop width in the description');
+      assert(d.regions.length > 0, 'a desktop with an xterm on it should have at least one region');
+
+      // The xterm is 100x35 cells of 14pt Monospace at +0+0 with a black
+      // background: a large black region at the top-left, whose text is the
+      // green prompt the entrypoint printed.
+      const terminal = d.regions.find((r) => r.color === '#000000' && r.bbox[0] < 20 && r.bbox[1] < 40 && r.bbox[2] > 500 && r.bbox[3] > 300);
+      assert(terminal, `no terminal-sized black region in ${JSON.stringify(d.regions.map((r) => [r.bbox, r.color]))}`);
+      const prompt = d.text.find((l) => /type here/i.test(l.text));
+      assert(prompt, `OCR did not find the prompt; text read: ${JSON.stringify(d.text.map((l) => l.text))}`);
+      assertEqual(prompt.region, terminal.id, 'the prompt was read from the terminal region');
+      const [tx, ty, tw, th] = terminal.bbox;
+      assert(
+        prompt.bbox.x >= tx && prompt.bbox.y >= ty && prompt.bbox.x + prompt.bbox.width <= tx + tw && prompt.bbox.y + prompt.bbox.height <= ty + th,
+        `the prompt's box ${JSON.stringify(prompt.bbox)} lies inside the terminal ${JSON.stringify(terminal.bbox)}`,
+      );
+      assert(prompt.bbox.y < 60, `the prompt is the terminal's first line, got y=${prompt.bbox.y}`);
+
+      // The 256x256 noise window at (700, 50) has no flat colour and no text.
+      const inNoise = (x, y) => x >= 700 && x < 956 && y >= 50 && y < 306;
+      const noiseRegions = d.regions.filter((r) => inNoise(r.bbox[0] + r.bbox[2] / 2, r.bbox[1] + r.bbox[3] / 2) && r.bbox[2] <= 256);
+      assertEqual(noiseRegions.length, 0, `random noise should yield no region, got ${JSON.stringify(noiseRegions)}`);
+      const noiseText = d.text.filter((l) => inNoise(l.bbox.x, l.bbox.y) && l.confidence >= 60);
+      assertEqual(noiseText.length, 0, `random noise should yield no confident text, got ${JSON.stringify(noiseText)}`);
+
+      const again = await session.describe();
+      assertEqual(again.cached, true, 'the same screen is described from the cache');
+      console.log(`       ${d.regions.length} regions, ${d.text.length} lines of text, ${d.elapsedMs}ms`);
+    });
+
     await test('screenshots can be JPEG', async () => {
       const shot = await session.screenshot({ format: 'jpeg', quality: 70 });
       assertEqual(shot.mimeType, 'image/jpeg', 'mime type');
@@ -292,6 +324,21 @@ async function testOpenDesktop() {
       assertEqual(inDesktop(id, ['cat', '/tmp/typed.txt']), 'hello vnc', 'the terminal should have read the typed line');
       const changed = pixelsDiffering(before, session.client.framebuffer);
       assert(changed > 100, `typing should have repainted the screen, but only ${changed} pixels changed`);
+    });
+
+    await test('the change report says the terminal repainted, and the typed text is now readable', async () => {
+      // The last look was the description above, before anything was typed.
+      const d = await session.describe();
+      assert(d.changedSince, 'there was an earlier look to compare with');
+      assert(d.changedSince.rects.length > 0, 'typing changed something');
+      const terminal = d.regions.find((r) => r.color === '#000000' && r.bbox[0] < 20 && r.bbox[1] < 40);
+      const [tx, ty, tw, th] = terminal.bbox;
+      const touchesTerminal = d.changedSince.rects.some((r) => r.x < tx + tw && tx < r.x + r.width && r.y < ty + th && ty < r.y + r.height);
+      assert(touchesTerminal, `the changed rectangles ${JSON.stringify(d.changedSince.rects)} should overlap the terminal ${JSON.stringify(terminal.bbox)}`);
+
+      const typed = d.text.find((l) => /hello vnc/i.test(l.text));
+      assert(typed, `the typed line should now be readable; text read: ${JSON.stringify(d.text.map((l) => l.text))}`);
+      assertEqual(typed.region, terminal.id, 'and it is in the terminal');
     });
 
     await test('scrolling the terminal arrives as CopyRect and matches a fresh connection', async () => {
