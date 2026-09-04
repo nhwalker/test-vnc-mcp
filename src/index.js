@@ -11,6 +11,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 
 import { VncSession } from './session.js';
+import { analyzeImage } from './analyze.js';
 
 const session = new VncSession();
 
@@ -157,6 +158,85 @@ tool(
   },
 );
 
+tool(
+  'vnc_describe',
+  {
+    title: 'Describe the desktop as text',
+    description:
+      'Describe the current desktop as data instead of pixels: its regions (windows, panels, ' +
+      'bars, buttons — flat-coloured areas, nested by containment), every line of text with ' +
+      'its bounding box and confidence, and which parts of the screen changed since you last ' +
+      'looked. All coordinates are full-size desktop pixels, ready for vnc_click. Use it to ' +
+      'find something to click on without reading a screenshot, or alongside one to get exact ' +
+      'coordinates. Takes about a second the first time a screen is seen; cached until it changes. ' +
+      'Text on photos or gradients is still read but belongs to no region.',
+    inputSchema: {
+      since: z
+        .number()
+        .int()
+        .min(0)
+        .optional()
+        .describe('Report changes since this desktop update number (from an earlier reply). Default: since your last screenshot or description.'),
+      regions: z.boolean().optional().describe('Find regions (default true).'),
+      text: z.boolean().optional().describe('Read text (default true). Regions alone are fast.'),
+      words: z.boolean().optional().describe('Also return a box per word, not just per line (default false; several times more output).'),
+      quietMs: z
+        .number()
+        .int()
+        .min(0)
+        .max(5000)
+        .optional()
+        .describe('Describe once the screen has been still for this long, in ms (default 100; 0 describes at once).'),
+      maxWaitMs: z
+        .number()
+        .int()
+        .min(0)
+        .max(30000)
+        .optional()
+        .describe('Give up waiting for stillness after this long and describe anyway (default 500).'),
+    },
+    annotations: { readOnlyHint: true },
+  },
+  async (args) => text(await session.describe(args)),
+);
+
+tool(
+  'vnc_describe_image',
+  {
+    title: 'Describe an image you already have',
+    description:
+      'The same analysis as vnc_describe — regions, text with bounding boxes, hints — over a ' +
+      'PNG or JPEG you supply, such as a screenshot taken earlier, rather than the live ' +
+      'desktop. Needs no VNC connection. Pass bbox to analyse only part of the image; results ' +
+      'stay in whole-image coordinates. If the image is a shrunk screenshot, pass the factor ' +
+      'it reported as scale and every coordinate comes back in desktop pixels.',
+    inputSchema: {
+      image: z.string().min(1).describe('The image as base64 (a data: URL is accepted too). PNG or JPEG.'),
+      mimeType: z.enum(['image/png', 'image/jpeg']).optional().describe('Optional; the bytes are checked either way.'),
+      bbox: z
+        .object({
+          x: z.number().int().min(0),
+          y: z.number().int().min(0),
+          width: z.number().int().min(1),
+          height: z.number().int().min(1),
+        })
+        .optional()
+        .describe('Analyse only this rectangle of the image, in image pixels.'),
+      scale: z
+        .number()
+        .positive()
+        .max(16)
+        .optional()
+        .describe('Multiply every returned coordinate by this (default 1), e.g. the factor a scaled vnc_screenshot reported.'),
+      regions: z.boolean().optional().describe('Find regions (default true).'),
+      text: z.boolean().optional().describe('Read text (default true).'),
+      words: z.boolean().optional().describe('Also return a box per word (default false).'),
+    },
+    annotations: { readOnlyHint: true },
+  },
+  async (args) => text(await analyzeImage(session.ocr, args)),
+);
+
 // --- pointer -----------------------------------------------------------------
 
 const x = z.number().int().describe('X in pixels from the left edge of the desktop.');
@@ -274,12 +354,24 @@ tool(
 
 // --- run ---------------------------------------------------------------------
 
+let shuttingDown = false;
 const shutdown = () => {
-  session.disconnect();
-  process.exit(0);
+  if (shuttingDown) return;
+  shuttingDown = true;
+  // The OCR worker thread would otherwise keep the process alive after the
+  // client has gone; give it a moment to stop cleanly, then leave regardless.
+  const bail = setTimeout(() => process.exit(0), 2000);
+  session.close().finally(() => {
+    clearTimeout(bail);
+    process.exit(0);
+  });
 };
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
+// The client closed our stdin: it is done with us. The SDK's stdio transport
+// does not watch for end-of-file itself, so listen for it here.
+process.stdin.on('end', shutdown);
+server.server.onclose = shutdown;
 
 await server.connect(new StdioServerTransport());
 console.error('vnc-mcp ready on stdio');

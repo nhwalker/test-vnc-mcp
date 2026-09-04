@@ -16,15 +16,17 @@
   "scripts": {
     "start": "node src/index.js",
     "test": "npm run test:unit && npm run test:e2e",
-    "test:unit": "node --test test/framebuffer.test.mjs",
+    "test:unit": "node --test test/*.test.mjs",
     "test:e2e": "node test/smoke.mjs"
   },
   "license": "Unlicense",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
     "@novnc/novnc": "1.7.0",
+    "@tesseract.js-data/eng": "^1.0.0",
     "jpeg-js": "^0.4.4",
     "pngjs": "^7.0.0",
+    "tesseract.js": "^7.0.0",
     "zod": "^3.25.0"
   }
 }

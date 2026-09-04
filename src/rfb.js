@@ -25,6 +25,7 @@ import {
   vncAuthResponse,
 } from './novnc.js';
 import { Framebuffer } from './framebuffer.js';
+import { DamageLog } from './damage.js';
 
 const SEC_NONE = 1;
 const SEC_VNC_AUTH = 2;
@@ -113,6 +114,8 @@ export class RfbClient {
     this.updateCount = 0;
     /** Rectangles decoded so far, by encoding name: which one the server chose. */
     this.stats = { updates: 0, rects: {} };
+    /** Which rectangles each recent update touched; see damageSince(). */
+    this.damage = new DamageLog();
     Object.defineProperty(this.stats, 'bytesReceived', { enumerable: true, get: () => this._channel.bytesReceived });
 
     this.closed = false;
@@ -138,6 +141,20 @@ export class RfbClient {
   /** RGBA, `width * height * 4` bytes. Live: copy before holding on to it. */
   get framebuffer() {
     return this.fb.data;
+  }
+
+  /**
+   * The parts of the screen the server has redrawn since update number
+   * `since` (compare with `updateCount`), merged into as few rectangles as
+   * make sense. Comes straight from the protocol: every FramebufferUpdate
+   * lists the rectangles it carries, so nothing is diffed.
+   *
+   * @returns {{ complete: boolean, rects: {x:number,y:number,width:number,height:number}[] }}
+   *   `complete` is false when `since` is older than the history kept, and
+   *   the whole screen should be assumed changed.
+   */
+  damageSince(since) {
+    return this.damage.since(since);
   }
 
   /**
@@ -425,6 +442,7 @@ export class RfbClient {
 
     this.updateCount += 1;
     this.stats.updates += 1;
+    this.damage.commit(this.updateCount);
     this._notifyUpdate(true);
     // Keep exactly one request outstanding, so the framebuffer tracks the
     // desktop without polling.
@@ -441,6 +459,7 @@ export class RfbClient {
 
       case E.pseudoEncodingDesktopSize:
         this.fb.resize(rect.width, rect.height);
+        this.damage.add(0, 0, rect.width, rect.height); // a resize redraws everything
         return true;
 
       case E.pseudoEncodingDesktopName: {
@@ -463,6 +482,7 @@ export class RfbClient {
         if (complete) {
           const name = encodingName(rect.encoding);
           this.stats.rects[name] = (this.stats.rects[name] ?? 0) + 1;
+          this.damage.add(rect.x, rect.y, rect.width, rect.height);
         }
         return complete;
       }
